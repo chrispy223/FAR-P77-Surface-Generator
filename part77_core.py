@@ -357,9 +357,16 @@ class Model:
         plane = f.plane_from_st(z_at_s0 - dz_ds * s0, dz_ds, dz_dt)
 
         n = max(4, int(abs(ds) / 200.0))
+        stations = [s0 + ds * i / n for i in range(n + 1)]
+        cross = self._conical_crossing_s(f, e, 1 if s0 >= 0 else -1, side,
+                                         a0, a1)
+        if cross is not None:
+            sgn = 1 if s0 >= 0 else -1
+            sc = sgn * cross
+            stations += [sc - sgn * 0.5, sc + sgn * 0.5]
+            stations.sort(key=lambda v: (v - s0) / ds)
         inner_pts, outer_pts = [], []
-        for i in range(n + 1):
-            s = s0 + ds * i / n
+        for s in stations:
             ie = f.inner(s)
             if ie is None:
                 continue
@@ -385,11 +392,26 @@ class Model:
                                  "%s transitional %s" % (f.rwy.id, e.id),
                                  f.rwy.id))
 
+    def beyond_conical(self, f, s, side, half):
+        """True where the approach edge at this station lies outside the
+        conical surface limit. 77.19(d) attaches the 5,000 ft transitional
+        only to portions of a precision approach that project through and
+        beyond the conical."""
+        x, y = f.world(s, side * half)
+        return not self.cpoly.covers(Point(x, y))
+
     def _trans_run(self, f, e, s, side, half, z_in):
-        """Outward run to where the transitional meets the horizontal or
-        conical. 77.19(d) substitutes a flat 5,000 ft where the precision
-        approach has already climbed past both."""
-        cap = TRANS_RUN_PRECISION if e.crit["precision"] else None
+        """Outward run of the transitional at this station.
+
+        Inside the conical limit the transitional rises 7:1 and terminates
+        where it meets the horizontal or conical surface. Once the approach
+        has climbed above both there is nothing left to terminate against and
+        the transitional simply ends. Only past the conical limit does the
+        flat 5,000 ft extension of 77.19(d) apply, and only for a precision
+        approach.
+        """
+        if self.beyond_conical(f, s, side, half):
+            return TRANS_RUN_PRECISION if e.crit["precision"] else 0.0
 
         def above(run):
             x, y = f.world(s, side * (half + run))
@@ -399,8 +421,8 @@ class Model:
             return z_in + run / TRANS_SLOPE >= ceil
 
         if above(0.0):
-            return cap or 0.0
-        hi = cap if cap else (self.cone_z - z_in) * TRANS_SLOPE + CONE_HORIZ
+            return 0.0
+        hi = (self.cone_z - z_in) * TRANS_SLOPE + CONE_HORIZ
         if not above(hi):
             return hi
         lo = 0.0
@@ -411,6 +433,23 @@ class Model:
             else:
                 lo = m
         return lo
+
+    def _conical_crossing_s(self, f, e, sign, side, a_lo, a_hi):
+        """Station where the approach edge crosses the conical limit, so the
+        footprint edge lands flush on it instead of on a sample station."""
+        def out(a):
+            ie = f.inner(sign * a)
+            return ie is not None and self.beyond_conical(f, sign * a, side, ie[0])
+        if out(a_lo) == out(a_hi):
+            return None
+        lo, hi = a_lo, a_hi
+        for _ in range(40):
+            m = (lo + hi) / 2.0
+            if out(m) == out(a_lo):
+                lo = m
+            else:
+                hi = m
+        return (lo + hi) / 2.0
 
     # -- point query ---------------------------------------------------
     def controlling(self, x, y):
