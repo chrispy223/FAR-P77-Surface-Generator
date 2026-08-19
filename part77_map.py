@@ -31,6 +31,14 @@ function style(f){
   return {color:f.properties.color, weight:1, opacity:.9,
           fillColor:f.properties.color, fillOpacity:SHOW_COMPOSITE?0.55:0.22};
 }
+/* composite faces are drawn without strokes; the dissolved outline of each
+   surface is drawn over the top instead, so interior face edges disappear */
+function fillOnly(f){
+  return {stroke:false, fillColor:f.properties.color, fillOpacity:0.55};
+}
+function lineOnly(f){
+  return {color:f.properties.color, weight:1.4, opacity:.95, fill:false};
+}
 const groups = {};
 const order = ["CONICAL","HORIZONTAL","TRANSITIONAL5000","TRANSITIONAL",
                "APPROACH2","APPROACH","PRIMARY"];
@@ -44,7 +52,15 @@ function addLayer(name, feats, show){
 }
 
 if(SHOW_COMPOSITE){
-  addLayer("Composite (controlling surface)", D.composite, true);
+  const g = L.geoJSON({type:"FeatureCollection",features:D.composite},
+                      {style:fillOnly, interactive:false}).addTo(map);
+  groups["Composite (controlling surface)"] = g;
+  if(D.composite_outlines && D.composite_outlines.length){
+    const o = L.geoJSON({type:"FeatureCollection",
+                         features:D.composite_outlines},
+                        {style:lineOnly, interactive:false}).addTo(map);
+    groups["Surface boundaries"] = o;
+  }
 } else {
   order.forEach(k => addLayer(k, D.layers[k], true));
 }

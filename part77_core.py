@@ -613,10 +613,26 @@ def to_geojson(model, composite=None):
     layers = {}
     for pc in model.pieces:
         layers.setdefault(pc.kind, []).append(feat(pc.poly, props(pc)))
-    comp = []
+    comp, outlines = [], []
     if composite:
+        by_kind = {}
         for poly, pc in composite:
             comp.append(feat(poly, props(pc)))
+            by_kind.setdefault(pc.kind, []).append(poly)
+        # Every atomic face has its own edges, and drawing all of them buries
+        # the map in interior lines. Dissolve the faces of each surface so only
+        # the outline of the region it governs is stroked.
+        for kind, polys in by_kind.items():
+            merged = unary_union([p.buffer(0.5) for p in polys]).buffer(-0.5)
+            parts = [merged] if merged.geom_type == "Polygon" else \
+                list(getattr(merged, "geoms", []))
+            for pg in parts:
+                if pg.is_empty or pg.area < 100.0:
+                    continue
+                f = feat(pg, {"kind": kind, "label": kind,
+                              "color": COLORS.get(kind, "#888888")})
+                if f:
+                    outlines.append(f)
 
     rwy = []
     for f in model.frames:
@@ -633,6 +649,7 @@ def to_geojson(model, composite=None):
         "hbound": lf.inv_ring(model.hpoly.exterior.coords),
         "layers": {k: [f for f in v if f] for k, v in layers.items()},
         "composite": [f for f in comp if f],
+        "composite_outlines": outlines,
         "runways": [f for f in rwy if f],
     }
 
