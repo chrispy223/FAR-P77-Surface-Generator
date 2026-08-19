@@ -194,6 +194,22 @@ class Frame:
 # ===========================================================================
 # Surface pieces
 # ===========================================================================
+def as_polygons(geom):
+    """Flatten to simple polygons. Cleaning a self-touching strip can split it
+    into several parts, and a piece is assumed to be one polygon everywhere
+    downstream."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+        out = []
+        for g in geom.geoms:
+            out.extend(as_polygons(g))
+        return out
+    return []
+
+
 class Piece:
     __slots__ = ("kind", "poly", "plane", "label", "runway")
 
@@ -285,8 +301,9 @@ class Model:
         self.pieces.append(Piece("HORIZONTAL", self.hpoly,
                                  (self.horiz_z, 0.0, 0.0), "Horizontal"))
         ring = Polygon(self.cpoly.exterior).difference(self.hpoly)
-        self.pieces.append(ConicalPiece(ring, self.hbound, self.horiz_z,
-                                        "Conical"))
+        for pg in as_polygons(ring):
+            self.pieces.append(ConicalPiece(pg, self.hbound, self.horiz_z,
+                                            "Conical"))
 
     # -- per runway ----------------------------------------------------
     def _runway_pieces(self, f):
@@ -380,7 +397,8 @@ class Model:
         poly = Polygon(ring)
         if not poly.is_valid:
             poly = poly.buffer(0)
-        if poly.is_empty or poly.area < 1.0:
+        parts = [pg for pg in as_polygons(poly) if pg.area >= 1.0]
+        if not parts:
             return
         kind = "TRANSITIONAL"
         if e.crit["precision"]:
@@ -388,9 +406,10 @@ class Model:
             if abs(np.hypot(*(np.array(outer_pts[mid]) - np.array(inner_pts[mid])))
                    - TRANS_RUN_PRECISION) < 1.0:
                 kind = "TRANSITIONAL5000"
-        self.pieces.append(Piece(kind, poly, plane,
-                                 "%s transitional %s" % (f.rwy.id, e.id),
-                                 f.rwy.id))
+        for pg in parts:
+            self.pieces.append(Piece(kind, pg, plane,
+                                     "%s transitional %s" % (f.rwy.id, e.id),
+                                     f.rwy.id))
 
     def beyond_conical(self, f, s, side, half):
         """True where the approach edge at this station lies outside the
