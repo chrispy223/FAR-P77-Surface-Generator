@@ -637,6 +637,70 @@ def to_geojson(model, composite=None):
     }
 
 
+def triangulate(poly):
+    """Triangles covering a polygon, holes included.
+
+    Fanning from the centroid only works for convex rings; the conical is an
+    annulus and composite faces can be concave, so both need a real
+    triangulation. Delaunay over the boundary vertices, keeping only the
+    triangles whose centroid is actually inside the polygon, handles every
+    case here without another dependency.
+    """
+    from matplotlib.tri import Triangulation
+    rings = [np.asarray(poly.exterior.coords)[:-1]]
+    for r in poly.interiors:
+        rings.append(np.asarray(r.coords)[:-1])
+    pts = np.vstack(rings)
+    if len(pts) < 3:
+        return []
+    try:
+        tri = Triangulation(pts[:, 0], pts[:, 1])
+    except Exception:
+        return []
+    out = []
+    for a, b, c in tri.triangles:
+        t = pts[[a, b, c]]
+        if poly.covers(Point(t[:, 0].mean(), t[:, 1].mean())):
+            out.append(t)
+    return out
+
+
+def to_mesh3d(model, composite=None, use_composite=False):
+    """Triangles in local feet, grouped by surface, for the 3D view."""
+    groups = {}
+
+    def add(kind, poly, z_at):
+        if poly.is_empty:
+            return
+        polys = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
+        buf = groups.setdefault(kind, [])
+        for pg in polys:
+            for t in triangulate(pg):
+                for x, y in t:
+                    buf.extend([round(float(x), 1), round(float(y), 1),
+                                round(float(z_at(x, y)), 2)])
+
+    if use_composite and composite:
+        for poly, pc in composite:
+            add("COMPOSITE:" + pc.kind, poly, pc.z)
+    else:
+        for pc in model.pieces:
+            add(pc.kind, pc.poly, pc.z)
+    for f in model.frames:
+        poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
+                        f.world(f.half, -f.rwy.width / 2),
+                        f.world(f.half, f.rwy.width / 2),
+                        f.world(-f.half, f.rwy.width / 2)])
+        add("RUNWAY", poly, lambda x, y, f=f: f.centerline_z(f.local(x, y)[0]))
+
+    colors = {}
+    for k in groups:
+        colors[k] = COLORS.get(k.split(":")[-1], "#888888")
+    return {"groups": groups, "colors": colors,
+            "elev": model.elev, "horiz_z": model.horiz_z,
+            "cone_z": model.cone_z}
+
+
 # ===========================================================================
 def to_dxf(model, composite=None, epsg=None):
     import ezdxf
@@ -663,14 +727,7 @@ def to_dxf(model, composite=None, epsg=None):
         polys = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
         n = 0
         for pg in polys:
-            pts = list(pg.exterior.coords)[:-1]
-            if len(pts) < 3:
-                continue
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            for i in range(len(pts)):
-                a, b = pts[i], pts[(i + 1) % len(pts)]
-                tri = [(cx, cy), a, b]
+            for tri in triangulate(pg):
                 out = []
                 for x, y in tri:
                     zz = z_at(x, y)
