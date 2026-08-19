@@ -16,13 +16,21 @@ import streamlit as st
 
 import part77_core as C
 import part77_map as M
+import part77_view3d as V3
 
 st.set_page_config(page_title="Part 77 Surface Generator",
                    page_icon="✈", layout="wide")
 
-ADIP_URL = ("https://adip.faa.gov/agis/public/api/airport/"
-            "getAirportDetails?locId={loc}")
-UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+# ADIP's public portal POSTs the identifier as a JSON body; there is no
+# query string on this endpoint.
+ADIP_URL = "https://adip.faa.gov/agisServices/public-api/getAirportDetails"
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "Origin": "https://adip.faa.gov",
+      "Referer": "https://adip.faa.gov/"}
 
 CAT_LABELS = {c: "[%d] %s" % (i + 1, C.PART77[c]["short"])
               for i, c in enumerate(C.CODES)}
@@ -45,9 +53,14 @@ def fetch_adip(loc, url=ADIP_URL):
     loc = loc.strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{3,4}", loc):
         raise ValueError("Identifier should be 3 or 4 letters or digits.")
-    req = urllib.request.Request(url.format(loc=loc), headers=UA)
+    body = json.dumps({"locId": loc}).encode()
+    req = urllib.request.Request(url, data=body, headers=UA, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+        raw = r.read().decode("utf-8", "replace")
+    rec = json.loads(raw)
+    if not rec or not rec.get("runways"):
+        raise ValueError("ADIP returned no runway data for %s." % loc)
+    return rec
 
 
 def adip_to_rows(rec):
@@ -288,15 +301,30 @@ if S.model is None:
 model, comp = S.model, S.composite
 
 st.subheader("Part 77 surfaces")
-mode = st.radio("View", ["Composite (controlling surface)",
-                         "Individual surfaces"],
-                horizontal=True, label_visibility="collapsed")
-is_comp = mode.startswith("Composite")
-st.caption("Move the cursor over the map for the exact Part 77 elevation at "
-           "that point. Overlapping areas show only the lowest surface.")
-st.components.v1.html(
-    M.render(C.to_geojson(model, comp if is_comp else None),
-             height=580, composite=is_comp), height=580)
+tab_map, tab_3d = st.tabs(["Map", "3D view"])
+
+with tab_map:
+    mode = st.radio("View", ["Composite (controlling surface)",
+                             "Individual surfaces"],
+                    horizontal=True, label_visibility="collapsed")
+    is_comp = mode.startswith("Composite")
+    st.caption("Move the cursor over the map for the exact Part 77 elevation "
+               "at that point. Overlapping areas show only the lowest surface.")
+    st.components.v1.html(
+        M.render(C.to_geojson(model, comp if is_comp else None),
+                 height=580, composite=is_comp), height=580)
+
+with tab_3d:
+    use_comp = st.toggle("Show composite instead of individual surfaces",
+                         value=False, key="3d_comp")
+    st.caption("Drag to orbit, shift-drag or right-drag to pan, wheel to "
+               "zoom. One finger orbits and two fingers pan and pinch on a "
+               "touch screen. At true scale these surfaces are nearly "
+               "invisible against a plan extent this wide, so start with the "
+               "exaggeration slider up.")
+    with st.spinner("Building mesh…"):
+        mesh = C.to_mesh3d(model, comp, use_composite=use_comp)
+    st.components.v1.html(V3.render(mesh, height=620), height=620)
 
 with st.expander("Surface parameters", expanded=True):
     rows = []
