@@ -21,16 +21,24 @@ import part77_view3d as V3
 st.set_page_config(page_title="Part 77 Surface Generator",
                    page_icon="✈", layout="wide")
 
-# ADIP's public portal POSTs the identifier as a JSON body; there is no
-# query string on this endpoint.
+# ADIP's public portal POSTs the identifier as a JSON body and sends a fixed
+# client key on every API call. The key is baked into the public Angular app,
+# not tied to a user login. If ADIP rotates it, Search will start returning
+# 400 or 401 — pull the current one out of devtools (any request to
+# /agisServices/, Headers tab, Authorization) and paste it below.
 ADIP_URL = "https://adip.faa.gov/agisServices/public-api/getAirportDetails"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0 Safari/537.36",
-      "Accept": "application/json, text/plain, */*",
-      "Content-Type": "application/json",
+ADIP_KEY = "Basic 3f647d1c-a3e7-415e-96e1-6e8415e6f209-ADIP"
+UA = {"Accept": "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Authorization": ADIP_KEY,
+      "Cache-Control": "no-cache",
+      "Content-Type": "application/json;charset=UTF-8",
       "Origin": "https://adip.faa.gov",
-      "Referer": "https://adip.faa.gov/"}
+      "Pragma": "no-cache",
+      "Referer": "https://adip.faa.gov/agis/public/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/151.0.0.0 Safari/537.36"}
 
 CAT_LABELS = {c: "[%d] %s" % (i + 1, C.PART77[c]["short"])
               for i, c in enumerate(C.CODES)}
