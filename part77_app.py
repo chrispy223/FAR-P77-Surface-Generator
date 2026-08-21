@@ -184,12 +184,18 @@ st.caption("14 CFR Part 77.19 · multi-runway · existing and proposed · "
            "surfaces reduced to the lowest controlling elevation · "
            "engine v%s" % C.__version__)
 
-c1, c2, c3 = st.columns([2, 1, 1])
-loc = c1.text_input("Airport ICAO or FAA identifier", value="LFT")
-c2.write("")
-go = c2.button("Search ADIP", type="primary", use_container_width=True)
-c3.write("")
-train = c3.button("Load training example", use_container_width=True)
+# A form so Enter in the identifier field submits, rather than only the
+# button working.
+with st.form("search", clear_on_submit=False):
+    c1, c2, c3 = st.columns([2, 1, 1])
+    loc = c1.text_input("Airport ICAO or FAA identifier", value="LFT",
+                        help="Press Enter or click Search")
+    c2.write("")
+    go = c2.form_submit_button("Search ADIP", type="primary",
+                               use_container_width=True)
+    c3.write("")
+    train = c3.form_submit_button("Load training example",
+                                  use_container_width=True)
 
 up = st.file_uploader("…or load a saved ADIP getAirportDetails JSON "
                       "(use this if ADIP will not answer directly)",

@@ -41,7 +41,7 @@ VIEW_HTML = r"""
 <script>
 const D = __DATA__;
 const wrap = document.getElementById('wrap');
-const W = wrap.clientWidth, H = wrap.clientHeight;
+let W = wrap.clientWidth, H = wrap.clientHeight;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b1723);
@@ -184,6 +184,20 @@ cv.addEventListener('touchmove',e=>{
 },{passive:false});
 cv.addEventListener('touchend',e=>{e.preventDefault(); touch=null;},{passive:false});
 document.addEventListener('gesturestart',e=>e.preventDefault());
+
+/* follow the container: Streamlit hands the component the full column
+   width, which changes when the browser window does */
+function resize(){
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  if(!w || !h || (w===W && h===H)) return;
+  W = w; H = h;
+  camera.aspect = W/H;
+  camera.updateProjectionMatrix();
+  renderer.setSize(W,H);
+  apply();
+}
+if(window.ResizeObserver) new ResizeObserver(resize).observe(wrap);
+window.addEventListener('resize', resize);
 
 setVE(8);
 </script>

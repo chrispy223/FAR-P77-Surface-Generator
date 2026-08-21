@@ -139,6 +139,11 @@ map.on('mousemove', e => {
     bf.properties.label+'<br>'+
     '<span class="s">'+lat.toFixed(5)+', '+lng.toFixed(5)+'</span>';
 });
+function fit(){ map.invalidateSize(); }
+if(window.ResizeObserver)
+  new ResizeObserver(fit).observe(document.getElementById('map'));
+window.addEventListener('resize', fit);
+
 map.on('mouseout', ()=>{ ro.innerHTML='<span class="s">move cursor over the map</span>'; });
 </script>
 """
