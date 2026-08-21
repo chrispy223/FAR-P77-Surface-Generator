@@ -829,10 +829,45 @@ def to_mesh3d(model, composite=None, use_composite=False):
                         f.world(-f.half, f.rwy.width / 2)])
         add("RUNWAY", poly, lambda x, y, f=f: f.centerline_z(f.local(x, y)[0]))
 
+    # Outlines drawn from the real piece boundaries. Deriving them from the
+    # triangles instead pulls in every interior diagonal, and a fan across a
+    # 37,000 ft approach corridor then stripes the whole surface.
+    edges = {}
+
+    def add_edge(kind, poly, z_at):
+        buf = edges.setdefault(kind, [])
+        for pg in as_polygons(poly):
+            for ring in [pg.exterior] + list(pg.interiors):
+                c = list(ring.coords)
+                for i in range(len(c) - 1):
+                    for x, y in (c[i], c[i + 1]):
+                        buf.extend([round(float(x), 1), round(float(y), 1),
+                                    round(float(z_at(x, y)), 2)])
+
+    if use_composite and composite:
+        by = {}
+        for poly, pc in composite:
+            by.setdefault(pc.kind, []).append((poly, pc))
+        for kind, items in by.items():
+            merged = unary_union([p.buffer(0.5) for p, _ in items]).buffer(-0.5)
+            _, pc0 = items[0]
+            for pg in as_polygons(merged):
+                add_edge("COMPOSITE:" + kind, pg, pc0.z)
+    else:
+        for pc in model.pieces:
+            add_edge(pc.kind, pc.poly, pc.z)
+    for f in model.frames:
+        poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
+                        f.world(f.half, -f.rwy.width / 2),
+                        f.world(f.half, f.rwy.width / 2),
+                        f.world(-f.half, f.rwy.width / 2)])
+        add_edge("RUNWAY", poly,
+                 lambda x, y, f=f: f.centerline_z(f.local(x, y)[0]))
+
     colors = {}
     for k in groups:
         colors[k] = COLORS.get(k.split(":")[-1], "#888888")
-    return {"groups": groups, "colors": colors,
+    return {"groups": groups, "edges": edges, "colors": colors,
             "elev": model.elev, "horiz_z": model.horiz_z,
             "cone_z": model.cone_z}
 

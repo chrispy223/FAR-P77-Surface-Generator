@@ -72,10 +72,17 @@ Object.keys(D.groups).forEach(k => {
     color:new THREE.Color(D.colors[k]), transparent:true, opacity:0.42,
     side:THREE.DoubleSide, depthWrite:false});
   const mesh = new THREE.Mesh(g,m);
-  const wire = new THREE.LineSegments(new THREE.EdgesGeometry(g,25),
-    new THREE.LineBasicMaterial({color:new THREE.Color(D.colors[k]),
-      transparent:true, opacity:0.5}));
-  const grp = new THREE.Group(); grp.add(mesh); grp.add(wire);
+  const grp = new THREE.Group(); grp.add(mesh);
+  /* outline comes from the surface boundary, not from triangle edges */
+  const ea = D.edges && D.edges[k];
+  if(ea && ea.length){
+    const ep = new Float32Array(ea.length);
+    for(let i=0;i<ea.length;i+=3){ ep[i]=ea[i]; ep[i+1]=ea[i+2]; ep[i+2]=-ea[i+1]; }
+    const eg = new THREE.BufferGeometry();
+    eg.setAttribute('position', new THREE.BufferAttribute(ep,3));
+    grp.add(new THREE.LineSegments(eg, new THREE.LineBasicMaterial({
+      color:new THREE.Color(D.colors[k]), transparent:true, opacity:0.85})));
+  }
   stage.add(grp); groups[k]=grp;
 });
 cx/=Math.max(n,1); cy/=Math.max(n,1);
