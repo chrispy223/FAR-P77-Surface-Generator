@@ -7,6 +7,7 @@ FAR Part 77 Airspace Surface Generator
 """
 
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -135,22 +136,53 @@ def load_dtpp(upload):
 
 
 def rows_to_runways(df):
+    """Build runways from the table, rejecting anything that would reach the
+    geometry with a blank or nonsense coordinate. A NaN survives float() and
+    only fails much later inside shapely, as an error nobody can act on."""
     rwys, problems = [], []
+
+    def num(row, key, lo, hi, what):
+        v = row.get(key)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("%s is blank" % what)
+        if not math.isfinite(v):
+            raise ValueError("%s is blank" % what)
+        if not (lo <= v <= hi):
+            raise ValueError("%s of %g is out of range" % (what, v))
+        return v
+
     for _, r in df.iterrows():
         if not bool(r.get("Include", True)):
             continue
+        name = str(r.get("Runway") or "").strip()
+        if not name or name.lower() == "nan":
+            continue                      # empty row from the editor
         try:
-            b = C.RunwayEnd(str(r["End 1"]), float(r["Lat 1"]),
-                            float(r["Lon 1"]), float(r["Elev 1"]),
-                            LABEL_CAT.get(r["Cat 1"], "B(V)"))
-            e = C.RunwayEnd(str(r["End 2"]), float(r["Lat 2"]),
-                            float(r["Lon 2"]), float(r["Elev 2"]),
-                            LABEL_CAT.get(r["Cat 2"], "B(V)"))
-            rwys.append(C.Runway(str(r["Runway"]), b, e,
-                                 float(r["Width (ft)"] or 150),
+            ends = []
+            for n, side in (("1", "end 1"), ("2", "end 2")):
+                lat = num(r, "Lat " + n, -90.0, 90.0, "%s latitude" % side)
+                lon = num(r, "Lon " + n, -180.0, 180.0, "%s longitude" % side)
+                elev = num(r, "Elev " + n, -1500.0, 30000.0,
+                           "%s elevation" % side)
+                if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+                    raise ValueError("%s still sits at 0, 0 — enter its "
+                                     "coordinates" % side)
+                ends.append(C.RunwayEnd(
+                    str(r.get("End " + n) or n), lat, lon, elev,
+                    LABEL_CAT.get(r.get("Cat " + n), "B(V)")))
+            width = 150.0
+            try:
+                w = float(r.get("Width (ft)"))
+                if math.isfinite(w) and w > 0:
+                    width = w
+            except (TypeError, ValueError):
+                pass
+            rwys.append(C.Runway(name, ends[0], ends[1], width,
                                  str(r.get("Status", "existing"))))
         except Exception as ex:
-            problems.append("%s: %s" % (r.get("Runway", "?"), ex))
+            problems.append("%s: %s" % (name, ex))
     return rwys, problems
 
 
@@ -321,11 +353,17 @@ if e2.button("Generate Part 77 surfaces", type="primary"):
     if rwys:
         lat = apt["lat"] or rwys[0].base.lat
         lon = apt["lon"] or rwys[0].base.lon
-        with st.spinner("Building surfaces…"):
-            S.model = C.Model(lat, lon, apt["elev"], rwys)
-            S.composite = S.model.composite()
-            S.pop("mesh_comp", None)
-            S.pop("mesh_ind", None)
+        try:
+            with st.spinner("Building surfaces…"):
+                S.model = C.Model(lat, lon, apt["elev"], rwys)
+                S.composite = S.model.composite()
+                S.pop("mesh_comp", None)
+                S.pop("mesh_ind", None)
+        except Exception as ex:
+            S.model = S.composite = None
+            st.error("Could not build the surfaces: %s\n\nCheck the runway "
+                     "table for a row with missing or placeholder "
+                     "coordinates." % ex)
     else:
         st.error("No runways selected.")
 
