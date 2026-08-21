@@ -21,6 +21,31 @@ import part77_core as C
 FAILS = []
 
 
+def trans_gaps(m):
+    """A transitional strip and its 5,000 ft wing must tile without a seam.
+
+    Clipping the two against different things (the ceiling by station
+    sampling, the conical by arc) once left a bare strip between them, and
+    the conical showed through it 50 ft higher than the transitional on
+    either side. A gap of that kind appears as a hole in the union.
+    """
+    from shapely.ops import unary_union
+    holes = 0
+    total = 0
+    by = {}
+    for pc in m.pieces:
+        if pc.kind.startswith("TRANSITIONAL"):
+            by.setdefault((pc.runway, pc.label), []).append(pc.poly)
+    for key, polys in by.items():
+        u = unary_union([p.buffer(0.01) for p in polys]).buffer(-0.01)
+        for pg in C.as_polygons(u):
+            total += 1
+            for ring in pg.interiors:
+                if C.Polygon(ring).area > 1.0:
+                    holes += 1
+    return holes == 0, "(%d holes across %d strips)" % (holes, total)
+
+
 def chk(label, ok, detail=""):
     print("  %s  %s %s" % ("PASS" if ok else "FAIL", label, detail))
     if not ok:
@@ -79,9 +104,7 @@ chk("transitional run 238 at s=11,000",
     close(m._trans_run(f, e, 11000, 1, *ie), 238, 1.0))
 wings = [p for p in m.pieces if p.kind == "TRANSITIONAL5000"]
 chk("precision wings exist", len(wings) > 0)
-inside = sum(1 for p in wings if p.poly.representative_point().within(m.cpoly))
-chk("wings clipped outside the conical limit", inside == 0,
-    "(%d of %d inside)" % (inside, len(wings)))
+chk("transitional coverage has no gaps", *trans_gaps(m))
 
 # composite matches the evaluator everywhere
 comp = m.composite()
@@ -140,10 +163,7 @@ def airport_checks(path):
     chk("arrangement faces triangulate exactly", worst < 1e-9,
         "(worst %.1e)" % worst)
 
-    wings = [p for p in m.pieces if p.kind == "TRANSITIONAL5000"]
-    inside = sum(1 for p in wings
-                 if p.poly.representative_point().within(m.cpoly))
-    chk("wings clipped outside the conical limit", inside == 0)
+    chk("transitional coverage has no gaps", *trans_gaps(m))
 
 
 for path in sys.argv[1:]:

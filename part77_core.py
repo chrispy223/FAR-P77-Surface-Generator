@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.11"
+__version__ = "2026-08-21.12"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -404,15 +404,18 @@ class Model:
         n = max(4, int(abs(ds) / 200.0))
         stations = [s0 + ds * i / n for i in range(n + 1)]
 
-        def emit(rings, kind, clip=None):
+        def build(rings):
             inner_pts, outer_pts = rings
             if len(inner_pts) < 2:
-                return
+                return None
             poly = Polygon(inner_pts + outer_pts[::-1])
             if not poly.is_valid:
                 poly = poly.buffer(0)
-            if clip is not None:
-                poly = poly.difference(clip)
+            return poly
+
+        def emit(poly, kind):
+            if poly is None:
+                return
             for pg in as_polygons(poly):
                 if pg.area >= 1.0:
                     self.pieces.append(Piece(
@@ -433,9 +436,14 @@ class Model:
                 continue
             inner_pts.append(f.world(st, side * half))
             outer_pts.append(f.world(st, side * (half + run)))
-        emit((inner_pts, outer_pts), "TRANSITIONAL")
+        term = build((inner_pts, outer_pts))
+        emit(term, "TRANSITIONAL")
 
-        # precision wing, clipped flush to the conical arc
+        # Precision wing. Cutting this against the conical arc while the
+        # terminated strip is cut against the ceiling by station sampling
+        # left a gap between them: two clips of the same edge that do not
+        # agree. Subtract the terminated strip itself instead, so the two
+        # share an exact boundary and nothing can fall between.
         if e.crit["precision"]:
             inner_pts, outer_pts = [], []
             for st in stations:
@@ -443,12 +451,13 @@ class Model:
                 if ie is None:
                     continue
                 half, z_in = ie
-                x, y = f.world(st, side * (half + TRANS_RUN_PRECISION))
-                if self.cpoly.covers(Point(x, y)):
-                    continue      # entirely inside; nothing survives the clip
                 inner_pts.append(f.world(st, side * half))
-                outer_pts.append((x, y))
-            emit((inner_pts, outer_pts), "TRANSITIONAL5000", clip=self.cpoly)
+                outer_pts.append(
+                    f.world(st, side * (half + TRANS_RUN_PRECISION)))
+            full = build((inner_pts, outer_pts))
+            if full is not None:
+                wing = full.difference(term) if term is not None else full
+                emit(wing, "TRANSITIONAL5000")
 
     def beyond_conical(self, f, s, side, half):
         """True where the approach edge at this station lies outside the
