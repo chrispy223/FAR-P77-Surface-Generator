@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.10"
+__version__ = "2026-08-21.11"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -990,44 +990,6 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
     if use_composite and composite:
         for poly, pc in composite:
             add("COMPOSITE:" + pc.kind, poly, pc.z, pc)
-        # The lower envelope is discontinuous wherever a surface domain ends
-        # against a higher neighbour — most visibly where a precision wing
-        # rises past the conical limit. Without vertical geometry every such
-        # step is a see-through slit. Walk each region boundary and hang a
-        # skirt wall from the high side down to whatever the envelope does on
-        # the far side.
-        def env(x, y):
-            z, _ = model.controlling(x, y)
-            return z
-        for poly, pc in composite:
-            kind = "COMPOSITE:" + display_kind(pc.kind, merge)
-            buf = groups.setdefault(kind, [])
-            ring = list(poly.exterior.coords)
-            for i in range(len(ring) - 1):
-                (x0, y0), (x1, y1) = ring[i], ring[i + 1]
-                dx, dy = x1 - x0, y1 - y0
-                L = math.hypot(dx, dy)
-                if L < 0.5:
-                    continue
-                nx, ny = -dy / L, dx / L
-                mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-                zin = pc.z(mx, my)
-                side = 1.0 if poly.covers(Point(mx + nx, my + ny)) else -1.0
-                zout = env(mx - side * nx * 0.8, my - side * ny * 0.8)
-                if zout is None or zin - zout < 0.5:
-                    continue
-                lo0 = env(x0 - side * nx * 0.8, y0 - side * ny * 0.8)
-                lo1 = env(x1 - side * nx * 0.8, y1 - side * ny * 0.8)
-                if lo0 is None:
-                    lo0 = zout
-                if lo1 is None:
-                    lo1 = zout
-                hi0, hi1 = pc.z(x0, y0), pc.z(x1, y1)
-                for t in (((x0, y0, hi0), (x1, y1, hi1), (x1, y1, lo1)),
-                          ((x0, y0, hi0), (x1, y1, lo1), (x0, y0, lo0))):
-                    for x, y, z in t:
-                        buf.extend([round(float(x), 1), round(float(y), 1),
-                                    round(float(z), 2)])
     else:
         fbp = model.faces_by_piece()
         for i, pc in enumerate(model.pieces):
