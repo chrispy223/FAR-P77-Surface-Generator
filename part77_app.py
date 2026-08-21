@@ -318,6 +318,8 @@ if e2.button("Generate Part 77 surfaces", type="primary"):
         with st.spinner("Building surfaces…"):
             S.model = C.Model(lat, lon, apt["elev"], rwys)
             S.composite = S.model.composite()
+            S.pop("mesh_comp", None)
+            S.pop("mesh_ind", None)
     else:
         st.error("No runways selected.")
 
@@ -347,9 +349,12 @@ with tab_3d:
                "touch screen. At true scale these surfaces are nearly "
                "invisible against a plan extent this wide, so start with the "
                "exaggeration slider up.")
-    with st.spinner("Building mesh…"):
-        mesh = C.to_mesh3d(model, comp, use_composite=use_comp)
-    st.components.v1.html(V3.render(mesh, height=620), height=620)
+    key = "mesh_comp" if use_comp else "mesh_ind"
+    if key not in S:
+        with st.spinner("Building mesh (once per generation)…"):
+            S[key] = V3.render(
+                C.to_mesh3d(model, comp, use_composite=use_comp), height=620)
+    st.components.v1.html(S[key], height=620)
 
 with st.expander("Surface parameters", expanded=True):
     rows = []

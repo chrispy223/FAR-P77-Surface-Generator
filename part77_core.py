@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.7"
+__version__ = "2026-08-21.9"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -513,7 +513,13 @@ class Model:
     def controlling(self, x, y):
         best, who = None, None
         p = Point(x, y)
-        for pc in self.pieces:
+        if getattr(self, "_pb", None) is None or len(self._pb) != len(self.pieces):
+            self._pb = np.array([pc.poly.bounds for pc in self.pieces])
+        b = self._pb
+        hit = np.nonzero((x >= b[:, 0] - 1.0) & (x <= b[:, 2] + 1.0) &
+                         (y >= b[:, 1] - 1.0) & (y <= b[:, 3] + 1.0))[0]
+        for i in hit:
+            pc = self.pieces[i]
             if not pc.poly.covers(p) and pc.poly.distance(p) > 1e-3:
                 continue
             z = pc.z(x, y)
@@ -778,65 +784,51 @@ def to_geojson(model, composite=None):
 
 
 def _earcut(ring, coll=1e-4):
-    """Ear clipping on a simple CCW ring.
+    """Ear clipping on a simple CCW ring, with the containment test done in
+    numpy across all remaining vertices at once. The scalar version spent
+    tens of seconds on 26 million individual point-in-triangle checks for a
+    single airport; this is the same algorithm at array speed.
 
-    `coll` is a perpendicular distance in feet, not a cross product. Testing
-    the raw cross product against a fixed epsilon fails on long edges: three
-    collinear points 200 ft apart on a 40,000 ft approach boundary still give
-    a cross product far above any absolute epsilon, so the vertex reads as
-    convex, gets clipped, and the replacement diagonal runs along the boundary
-    and strands every vertex between its ends. Those stranded vertices are
-    T-junctions, and in CAD they are cracks.
+    coll is a perpendicular distance in feet: on long boundary edges a raw
+    cross-product epsilon misreads collinear vertices as convex, clips them,
+    and leaves T-junction cracks along the boundary.
     """
-    n = len(ring)
+    P = np.asarray(ring, float)
+    n = len(P)
     if n < 3:
         return []
     idx = list(range(n))
-
-    def cross(a, b, c):
-        return ((b[0] - a[0]) * (c[1] - a[1]) -
-                (b[1] - a[1]) * (c[0] - a[0]))
-
-    def inside(p, a, b, c):
-        return (cross(a, b, p) >= 0 and cross(b, c, p) >= 0
-                and cross(c, a, p) >= 0)
-
     tris = []
-    guard = 0
-    while len(idx) > 3 and guard < 4 * n * n:
-        guard += 1
-        cut = False
+    while len(idx) > 3:
         m = len(idx)
+        R = P[idx]
+        cut = False
         for k in range(m):
             i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % m]
-            a, b, c = ring[i0], ring[i1], ring[i2]
-            x = cross(a, b, c)
+            a, b, c = P[i0], P[i1], P[i2]
+            x = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
             if x <= 0:
-                continue                      # reflex
+                continue
             base = math.hypot(c[0] - a[0], c[1] - a[1])
             if base > 0 and x / base <= coll:
-                continue                      # collinear within tolerance
-            bad = False
-            for j in idx:
-                if j in (i0, i1, i2):
-                    continue
-                if inside(ring[j], a, b, c):
-                    bad = True
-                    break
-            if bad:
                 continue
-            tris.append((a, b, c))
+            d1 = (b[0]-a[0])*(R[:,1]-a[1]) - (b[1]-a[1])*(R[:,0]-a[0])
+            d2 = (c[0]-b[0])*(R[:,1]-b[1]) - (c[1]-b[1])*(R[:,0]-b[0])
+            d3 = (a[0]-c[0])*(R[:,1]-c[1]) - (a[1]-c[1])*(R[:,0]-c[0])
+            ins = (d1 >= 0) & (d2 >= 0) & (d3 >= 0)
+            ins[k - 1] = ins[k] = ins[(k + 1) % m] = False
+            if ins.any():
+                continue
+            tris.append((tuple(a), tuple(b), tuple(c)))
             idx.pop(k)
             cut = True
             break
         if not cut:
             break
     if len(idx) == 3:
-        tris.append(tuple(ring[i] for i in idx))
+        tris.append(tuple(tuple(P[i]) for i in idx))
         return tris
     if coll > 0.0:
-        # refusing every collinear ear can stall; loosen and try again rather
-        # than return a partial cover
         return _earcut(ring, coll / 100.0)
     return tris
 
@@ -984,15 +976,6 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
         polys = []
         for pg0 in as_polygons(poly):
             if pc is not None and pc.plane is None:
-                mesh_polys(model, pc, pg0)      # ensures rings are cached
-                tris = triangulate_conical(model, pg0)
-                if tris is not None:
-                    for t in tris:
-                        for x, y in t:
-                            buf.extend([round(float(x), 1),
-                                        round(float(y), 1),
-                                        round(float(z_at(x, y)), 2)])
-                    continue
                 polys.extend(mesh_polys(model, pc, pg0))
             elif pc is not None:
                 polys.extend(mesh_polys(model, pc, pg0))
@@ -1122,20 +1105,6 @@ def to_dxf(model, composite=None, epsg=None):
     def emit_piece(pc, poly, lay):
         n = 0
         for pg0 in as_polygons(poly):
-            if pc.plane is None:
-                mesh_polys(model, pc, pg0)
-                tris = triangulate_conical(model, pg0)
-                if tris is not None:
-                    for t in tris:
-                        out = []
-                        for x, y in t:
-                            zz = pc.z(x, y)
-                            X, Y = xf(x, y) if xf else (x, y)
-                            out.append((X, Y, zz))
-                        out.append(out[2])
-                        msp.add_3dface(out, dxfattribs={"layer": lay})
-                        n += 1
-                    continue
             for pg in mesh_polys(model, pc, pg0):
                 n += emit(pg, pc.z, lay)
         return n
