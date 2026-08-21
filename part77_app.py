@@ -181,7 +181,8 @@ for k, v in (("rows", None), ("apt", None), ("model", None),
 
 st.title("✈ FAR Part 77 Airspace Surface Generator")
 st.caption("14 CFR Part 77.19 · multi-runway · existing and proposed · "
-           "surfaces reduced to the lowest controlling elevation")
+           "surfaces reduced to the lowest controlling elevation · "
+           "engine v%s" % C.__version__)
 
 c1, c2, c3 = st.columns([2, 1, 1])
 loc = c1.text_input("Airport ICAO or FAA identifier", value="LFT")
