@@ -512,7 +512,7 @@ class Model:
         best, who = None, None
         p = Point(x, y)
         for pc in self.pieces:
-            if not pc.poly.covers(p) and pc.poly.distance(p) > 1e-6:
+            if not pc.poly.covers(p) and pc.poly.distance(p) > 1e-3:
                 continue
             z = pc.z(x, y)
             if best is None or z < best - 1e-9:
@@ -839,19 +839,49 @@ def _earcut(ring, coll=1e-4):
     return tris
 
 
+def _tri_area(t):
+    return abs((t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) -
+               (t[1][1] - t[0][1]) * (t[2][0] - t[0][0])) / 2.0
+
+
 def triangulate(poly):
-    """Watertight triangles covering a polygon."""
+    """Watertight triangles covering a polygon.
+
+    Split faces out of the composite can carry near-degenerate boundaries the
+    ear clip stalls on, and a stall is a hole in the mesh. Every result is
+    therefore checked by area, and shortfalls retried on cleaned geometry.
+    """
     from shapely.geometry.polygon import orient
-    out = []
-    for pg in as_polygons(poly):
+
+    def rings(pg):
         if pg.interiors:
-            # nothing here should carry a hole once the conical is split into
-            # quadrants, but fall back rather than silently drop the piece
-            for q in as_polygons(_split_quadrants(pg)):
-                out.extend(_earcut(list(orient(q, 1.0).exterior.coords)[:-1]))
-            continue
-        out.extend(_earcut(list(orient(pg, 1.0).exterior.coords)[:-1]))
-    return [np.asarray(t, float) for t in out]
+            return [q for q in as_polygons(_split_quadrants(pg))]
+        return [pg]
+
+    def attempt(pg):
+        out = []
+        for q in rings(pg):
+            out.extend(_earcut(list(orient(q, 1.0).exterior.coords)[:-1]))
+        return out
+
+    result = []
+    for pg in as_polygons(poly):
+        tris = attempt(pg)
+        got = sum(_tri_area(t) for t in tris)
+        if abs(got - pg.area) > max(pg.area, 1.0) * 1e-6:
+            for fix in (pg.buffer(0), pg.simplify(0.02).buffer(0)):
+                tris2 = []
+                ok = True
+                tot = 0.0
+                for pg2 in as_polygons(fix):
+                    tt = attempt(pg2)
+                    tris2.extend(tt)
+                    tot += sum(_tri_area(t) for t in tt)
+                if abs(tot - pg.area) <= max(pg.area, 1.0) * 1e-4:
+                    tris = tris2
+                    break
+        result.extend(tris)
+    return [np.asarray(t, float) for t in result]
 
 
 def _split_quadrants(poly):
@@ -1002,23 +1032,37 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
                         buf.extend([round(float(x), 1), round(float(y), 1),
                                     round(float(z_at(x, y)), 2)])
 
+    def env_z(x, y):
+        z, _ = model.controlling(x, y)
+        return z if z is not None else model.horiz_z
+
     if use_composite and composite:
         by = {}
         for poly, pc in composite:
             by.setdefault(display_kind(pc.kind, merge), []).append((poly, pc))
         for kind, items in by.items():
             merged = unary_union([p.buffer(0.5) for p, _ in items]).buffer(-0.5)
-            _, pc0 = items[0]
             for pg in as_polygons(merged):
-                add_edge("COMPOSITE:" + kind, pg, pc0.z)
+                add_edge("COMPOSITE:" + kind, pg, env_z)
     else:
         by = {}
         for pc in model.pieces:
             by.setdefault(display_kind(pc.kind, merge), []).append(pc)
         for kind, pcs in by.items():
             merged = unary_union([pc.poly.buffer(0.5) for pc in pcs]).buffer(-0.5)
+
+            def kind_z(x, y, pcs=pcs):
+                best = None
+                pt = Point(x, y)
+                for pc in pcs:
+                    if pc.poly.covers(pt) or pc.poly.distance(pt) < 1.0:
+                        z = pc.z(x, y)
+                        if best is None or z < best:
+                            best = z
+                return best if best is not None else model.horiz_z
+
             for pg in as_polygons(merged):
-                add_edge(kind, pg, pcs[0].z)
+                add_edge(kind, pg, kind_z)
     for f in model.frames:
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
                         f.world(f.half, -f.rwy.width / 2),
