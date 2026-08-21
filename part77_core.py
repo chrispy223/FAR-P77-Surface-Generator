@@ -301,9 +301,18 @@ class Model:
         self.pieces.append(Piece("HORIZONTAL", self.hpoly,
                                  (self.horiz_z, 0.0, 0.0), "Horizontal"))
         ring = Polygon(self.cpoly.exterior).difference(self.hpoly)
-        for pg in as_polygons(ring):
-            self.pieces.append(ConicalPiece(pg, self.hbound, self.horiz_z,
-                                            "Conical"))
+        from shapely.geometry import box as _box
+        minx, miny, maxx, maxy = ring.bounds
+        cx, cy = self.hpoly.centroid.x, self.hpoly.centroid.y
+        d = 2.0 * max(maxx - minx, maxy - miny)
+        # An annulus has a hole, and a hole cannot be ear clipped directly.
+        # Quartering it about the centre yields four simple polygons.
+        for q in (_box(cx - d, cy - d, cx, cy), _box(cx, cy - d, cx + d, cy),
+                  _box(cx - d, cy, cx, cy + d), _box(cx, cy, cx + d, cy + d)):
+            for pg in as_polygons(ring.intersection(q)):
+                if pg.area > 1.0:
+                    self.pieces.append(ConicalPiece(
+                        pg, self.hbound, self.horiz_z, "Conical"))
 
     # -- per runway ----------------------------------------------------
     def _runway_pieces(self, f):
@@ -485,13 +494,36 @@ class Model:
     # ===================================================================
     # Composite: exact vector partition
     # ===================================================================
-    def composite(self):
-        lines = [pc.poly.exterior for pc in self.pieces]
-        for pc in self.pieces:
-            lines.extend(pc.poly.interiors)
-        merged = unary_union(lines)
-        faces = [f for f in polygonize(merged) if f.area > 25.0]
+    def arrangement(self):
+        """Every piece boundary noded together into one planar subdivision.
 
+        Faces produced this way share their edges vertex for vertex, so
+        meshing the faces rather than the pieces removes the T-junctions you
+        get when two surfaces abut but were sampled at different spacings.
+        Cached: both the composite and the meshes are built from it.
+        """
+        if getattr(self, "_faces", None) is None:
+            lines = [pc.poly.exterior for pc in self.pieces]
+            for pc in self.pieces:
+                lines.extend(pc.poly.interiors)
+            merged = unary_union(lines)
+            self._faces = [f for f in polygonize(merged) if f.area > 25.0]
+        return self._faces
+
+    def faces_by_piece(self):
+        """Which arrangement faces each piece covers."""
+        if getattr(self, "_fbp", None) is None:
+            out = {}
+            for face in self.arrangement():
+                p = face.representative_point()
+                for i, pc in enumerate(self.pieces):
+                    if pc.poly.covers(p):
+                        out.setdefault(i, []).append(face)
+            self._fbp = out
+        return self._fbp
+
+    def composite(self):
+        faces = self.arrangement()
         out = []
         for face in faces:
             out.extend(self._assign(face, 0))
@@ -673,32 +705,98 @@ def to_geojson(model, composite=None):
     }
 
 
-def triangulate(poly):
-    """Triangles covering a polygon, holes included.
+def _earcut(ring, coll=1e-4):
+    """Ear clipping on a simple CCW ring.
 
-    Fanning from the centroid only works for convex rings; the conical is an
-    annulus and composite faces can be concave, so both need a real
-    triangulation. Delaunay over the boundary vertices, keeping only the
-    triangles whose centroid is actually inside the polygon, handles every
-    case here without another dependency.
+    `coll` is a perpendicular distance in feet, not a cross product. Testing
+    the raw cross product against a fixed epsilon fails on long edges: three
+    collinear points 200 ft apart on a 40,000 ft approach boundary still give
+    a cross product far above any absolute epsilon, so the vertex reads as
+    convex, gets clipped, and the replacement diagonal runs along the boundary
+    and strands every vertex between its ends. Those stranded vertices are
+    T-junctions, and in CAD they are cracks.
     """
-    from matplotlib.tri import Triangulation
-    rings = [np.asarray(poly.exterior.coords)[:-1]]
-    for r in poly.interiors:
-        rings.append(np.asarray(r.coords)[:-1])
-    pts = np.vstack(rings)
-    if len(pts) < 3:
+    n = len(ring)
+    if n < 3:
         return []
-    try:
-        tri = Triangulation(pts[:, 0], pts[:, 1])
-    except Exception:
-        return []
+    idx = list(range(n))
+
+    def cross(a, b, c):
+        return ((b[0] - a[0]) * (c[1] - a[1]) -
+                (b[1] - a[1]) * (c[0] - a[0]))
+
+    def inside(p, a, b, c):
+        return (cross(a, b, p) >= 0 and cross(b, c, p) >= 0
+                and cross(c, a, p) >= 0)
+
+    tris = []
+    guard = 0
+    while len(idx) > 3 and guard < 4 * n * n:
+        guard += 1
+        cut = False
+        m = len(idx)
+        for k in range(m):
+            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % m]
+            a, b, c = ring[i0], ring[i1], ring[i2]
+            x = cross(a, b, c)
+            if x <= 0:
+                continue                      # reflex
+            base = math.hypot(c[0] - a[0], c[1] - a[1])
+            if base > 0 and x / base <= coll:
+                continue                      # collinear within tolerance
+            bad = False
+            for j in idx:
+                if j in (i0, i1, i2):
+                    continue
+                if inside(ring[j], a, b, c):
+                    bad = True
+                    break
+            if bad:
+                continue
+            tris.append((a, b, c))
+            idx.pop(k)
+            cut = True
+            break
+        if not cut:
+            break
+    if len(idx) == 3:
+        tris.append(tuple(ring[i] for i in idx))
+        return tris
+    if coll > 0.0:
+        # refusing every collinear ear can stall; loosen and try again rather
+        # than return a partial cover
+        return _earcut(ring, coll / 100.0)
+    return tris
+
+
+def triangulate(poly):
+    """Watertight triangles covering a polygon."""
+    from shapely.geometry.polygon import orient
     out = []
-    for a, b, c in tri.triangles:
-        t = pts[[a, b, c]]
-        if poly.covers(Point(t[:, 0].mean(), t[:, 1].mean())):
-            out.append(t)
-    return out
+    for pg in as_polygons(poly):
+        if pg.interiors:
+            # nothing here should carry a hole once the conical is split into
+            # quadrants, but fall back rather than silently drop the piece
+            for q in as_polygons(_split_quadrants(pg)):
+                out.extend(_earcut(list(orient(q, 1.0).exterior.coords)[:-1]))
+            continue
+        out.extend(_earcut(list(orient(pg, 1.0).exterior.coords)[:-1]))
+    return [np.asarray(t, float) for t in out]
+
+
+def _split_quadrants(poly):
+    """Cut a ring into four simple pieces about its centroid, so no piece has
+    a hole."""
+    from shapely.geometry import box
+    minx, miny, maxx, maxy = poly.bounds
+    cx, cy = poly.centroid.x, poly.centroid.y
+    d = max(maxx - minx, maxy - miny)
+    quads = [box(cx - d, cy - d, cx, cy), box(cx, cy - d, cx + d, cy),
+             box(cx - d, cy, cx, cy + d), box(cx, cy, cx + d, cy + d)]
+    parts = []
+    for q in quads:
+        parts.extend(as_polygons(poly.intersection(q)))
+    return parts
 
 
 def to_mesh3d(model, composite=None, use_composite=False):
@@ -720,8 +818,10 @@ def to_mesh3d(model, composite=None, use_composite=False):
         for poly, pc in composite:
             add("COMPOSITE:" + pc.kind, poly, pc.z)
     else:
-        for pc in model.pieces:
-            add(pc.kind, pc.poly, pc.z)
+        fbp = model.faces_by_piece()
+        for i, pc in enumerate(model.pieces):
+            for face in fbp.get(i, []):
+                add(pc.kind, face, pc.z)
     for f in model.frames:
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
                         f.world(f.half, -f.rwy.width / 2),
@@ -775,9 +875,11 @@ def to_dxf(model, composite=None, epsg=None):
         return n
 
     stats = {}
-    for pc in model.pieces:
+    fbp = model.faces_by_piece()
+    for i, pc in enumerate(model.pieces):
         lay = "P77-%s" % pc.kind
-        stats[lay] = stats.get(lay, 0) + emit(pc.poly, pc.z, lay)
+        for face in fbp.get(i, []):
+            stats[lay] = stats.get(lay, 0) + emit(face, pc.z, lay)
     for f in model.frames:
         lay = "P77-RUNWAY-%s" % f.rwy.id.replace("/", "-")
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
