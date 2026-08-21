@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.12"
+__version__ = "2026-08-21.13"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -1022,9 +1022,20 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
             for ring in [pg.exterior] + list(pg.interiors):
                 c = list(ring.coords)
                 for i in range(len(c) - 1):
-                    for x, y in (c[i], c[i + 1]):
-                        buf.extend([round(float(x), 1), round(float(y), 1),
-                                    round(float(z_at(x, y)), 2)])
+                    (x0, y0), (x1, y1) = c[i], c[i + 1]
+                    z0, z1 = z_at(x0, y0), z_at(x1, y1)
+                    # Where a region boundary runs along a cliff in the
+                    # envelope, consecutive vertices share a plan position but
+                    # differ by hundreds of feet, and the stroke draws a
+                    # vertical line up the face of the drop. The drop is real;
+                    # drawing a line on it is not, since nothing is there.
+                    run = math.hypot(x1 - x0, y1 - y0)
+                    if abs(z1 - z0) > max(2.0, run):
+                        continue
+                    buf.extend([round(float(x0), 1), round(float(y0), 1),
+                                round(float(z0), 2),
+                                round(float(x1), 1), round(float(y1), 1),
+                                round(float(z1), 2)])
 
     def env_z(x, y):
         z, _ = model.controlling(x, y)
