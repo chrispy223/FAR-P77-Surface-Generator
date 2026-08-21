@@ -44,6 +44,12 @@ reported, never applied.
 
 ## Known limits
 
+- The rendered/exported conical shell is a triangulated approximation of a
+  curved surface, faithful to within 10 ft (locally, near hull corners) and
+  far less elsewhere. All planar surfaces are exact. Obstacle evaluation
+  never uses the mesh: it evaluates the surface equations directly and is
+  exact everywhere, conical included.
+
 - The horizontal perimeter uses the convex hull of the arcs, which equals the
   77.19(c) tangent-line construction for a convex runway arrangement. An
   L-shaped airfield with an outlying runway could differ.

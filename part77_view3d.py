@@ -68,9 +68,11 @@ Object.keys(D.groups).forEach(k => {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos,3));
   g.computeVertexNormals();
+  const isComp = k.indexOf('COMPOSITE:')===0 || k==='RUNWAY';
   const m = new THREE.MeshBasicMaterial({
-    color:new THREE.Color(D.colors[k]), transparent:true, opacity:0.42,
-    side:THREE.DoubleSide, depthWrite:false});
+    color:new THREE.Color(D.colors[k]),
+    transparent:!isComp, opacity:isComp?1.0:0.42,
+    side:THREE.DoubleSide, depthWrite:isComp});
   const mesh = new THREE.Mesh(g,m);
   const grp = new THREE.Group(); grp.add(mesh);
   /* outline comes from the surface boundary, not from triangle edges */

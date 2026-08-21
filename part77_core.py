@@ -65,6 +65,22 @@ CONE_SLOPE = 20.0
 CONE_HORIZ = 4000.0
 CONE_HGT = HORIZ_HGT + CONE_HORIZ / CONE_SLOPE
 
+# A precision approach is one surface under 77.19(b) that changes slope at
+# 10,000 ft, and the transitional plus its 77.19(d) extension is one surface
+# too. They are modelled as separate planar pieces because that is what the
+# maths needs, but drawing them in different colours puts a seam across a
+# continuous surface. Merge them for display.
+DISPLAY_MERGE = {"APPROACH2": "APPROACH", "TRANSITIONAL5000": "TRANSITIONAL"}
+
+
+def display_kind(kind, merge=True):
+    if not merge:
+        return kind
+    pre, _, k = kind.rpartition(":")
+    k = DISPLAY_MERGE.get(k, k)
+    return (pre + ":" + k) if pre else k
+
+
 COLORS = {
     "PRIMARY": "#3ddc84", "APPROACH": "#ff5a5a", "APPROACH2": "#ffab3d",
     "TRANSITIONAL": "#5b97ff", "TRANSITIONAL5000": "#a8c8ff",
@@ -363,20 +379,21 @@ class Model:
                     self._trans_piece(f, e, sign, side, a0, a1)
 
     def _trans_piece(self, f, e, sign, side, a0, a1):
-        """Transitional strip over |s| in [a0, a1]. Linear in (s, t), so the
-        plane is exact; only the outer footprint edge needs stepping, since
-        it follows wherever the surface meets the horizontal or conical."""
+        """Two parts per strip. Inside the conical limit the transitional
+        rises 7:1 until it terminates on the horizontal or conical surface.
+        Outside it, a precision approach carries the 5,000 ft extension of
+        77.19(d); that wing is generated at full width and then clipped to
+        the conical limit, so its front edge follows the arc itself rather
+        than a straight station cut."""
         ie0, ie1 = f.inner(sign * a0), f.inner(sign * a1)
         if ie0 is None or ie1 is None:
             return
-        # z_in(s) = zi0 + dzi*(s - s0); half(s) = h0 + dh*(s - s0)
         s0, s1 = sign * a0, sign * a1
         ds = s1 - s0
         if abs(ds) < 1e-6:
             return
         dzi = (ie1[1] - ie0[1]) / ds
         dh = (ie1[0] - ie0[0]) / ds
-        # z = z_in + (side*t - half)/7   for the strip on this side
         dz_ds = dzi - dh / TRANS_SLOPE
         dz_dt = side / TRANS_SLOPE
         z_at_s0 = ie0[1] - side * (side * ie0[0]) / TRANS_SLOPE
@@ -384,41 +401,52 @@ class Model:
 
         n = max(4, int(abs(ds) / 200.0))
         stations = [s0 + ds * i / n for i in range(n + 1)]
-        cross = self._conical_crossing_s(f, e, 1 if s0 >= 0 else -1, side,
-                                         a0, a1)
-        if cross is not None:
-            sgn = 1 if s0 >= 0 else -1
-            sc = sgn * cross
-            stations += [sc - sgn * 0.5, sc + sgn * 0.5]
-            stations.sort(key=lambda v: (v - s0) / ds)
+
+        def emit(rings, kind, clip=None):
+            inner_pts, outer_pts = rings
+            if len(inner_pts) < 2:
+                return
+            poly = Polygon(inner_pts + outer_pts[::-1])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if clip is not None:
+                poly = poly.difference(clip)
+            for pg in as_polygons(poly):
+                if pg.area >= 1.0:
+                    self.pieces.append(Piece(
+                        kind, pg, plane,
+                        "%s transitional %s" % (f.rwy.id, e.id), f.rwy.id))
+
+        # terminated transitional, inside the conical limit
         inner_pts, outer_pts = [], []
-        for s in stations:
-            ie = f.inner(s)
+        for st in stations:
+            ie = f.inner(st)
             if ie is None:
                 continue
             half, z_in = ie
-            run = self._trans_run(f, e, s, side, half, z_in)
-            inner_pts.append(f.world(s, side * half))
-            outer_pts.append(f.world(s, side * (half + max(run, 0.0))))
-        if len(inner_pts) < 2:
-            return
-        ring = inner_pts + outer_pts[::-1]
-        poly = Polygon(ring)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        parts = [pg for pg in as_polygons(poly) if pg.area >= 1.0]
-        if not parts:
-            return
-        kind = "TRANSITIONAL"
+            if self.beyond_conical(f, st, side, half):
+                continue
+            run = self._trans_run(f, e, st, side, half, z_in)
+            if run <= 1e-6:
+                continue
+            inner_pts.append(f.world(st, side * half))
+            outer_pts.append(f.world(st, side * (half + run)))
+        emit((inner_pts, outer_pts), "TRANSITIONAL")
+
+        # precision wing, clipped flush to the conical arc
         if e.crit["precision"]:
-            mid = len(inner_pts) // 2
-            if abs(np.hypot(*(np.array(outer_pts[mid]) - np.array(inner_pts[mid])))
-                   - TRANS_RUN_PRECISION) < 1.0:
-                kind = "TRANSITIONAL5000"
-        for pg in parts:
-            self.pieces.append(Piece(kind, pg, plane,
-                                     "%s transitional %s" % (f.rwy.id, e.id),
-                                     f.rwy.id))
+            inner_pts, outer_pts = [], []
+            for st in stations:
+                ie = f.inner(st)
+                if ie is None:
+                    continue
+                half, z_in = ie
+                x, y = f.world(st, side * (half + TRANS_RUN_PRECISION))
+                if self.cpoly.covers(Point(x, y)):
+                    continue      # entirely inside; nothing survives the clip
+                inner_pts.append(f.world(st, side * half))
+                outer_pts.append((x, y))
+            emit((inner_pts, outer_pts), "TRANSITIONAL5000", clip=self.cpoly)
 
     def beyond_conical(self, f, s, side, half):
         """True where the approach edge at this station lies outside the
@@ -439,7 +467,7 @@ class Model:
         approach.
         """
         if self.beyond_conical(f, s, side, half):
-            return TRANS_RUN_PRECISION if e.crit["precision"] else 0.0
+            return 0.0
 
         def above(run):
             x, y = f.world(s, side * (half + run))
@@ -507,7 +535,18 @@ class Model:
             for pc in self.pieces:
                 lines.extend(pc.poly.interiors)
             merged = unary_union(lines)
-            self._faces = [f for f in polygonize(merged) if f.area > 25.0]
+            faces = []
+            for f in polygonize(merged):
+                if f.area <= 25.0:
+                    continue
+                # Nearly coincident boundaries (one runway's wing edge along
+                # another's approach edge) leave faces thousands of feet long
+                # and under a foot wide. They carry no area worth drawing, but
+                # edge-on under vertical exaggeration they render as fins.
+                if 4.0 * f.area / max(f.length, 1.0) < 1.0:
+                    continue
+                faces.append(f)
+            self._faces = faces
         return self._faces
 
     def faces_by_piece(self):
@@ -526,7 +565,11 @@ class Model:
         faces = self.arrangement()
         out = []
         for face in faces:
-            out.extend(self._assign(face, 0))
+            for poly, pc in self._assign(face, 0):
+                # splitting on crossing lines can create its own slivers
+                if 4.0 * poly.area / max(poly.length, 1.0) < 1.0:
+                    continue
+                out.append((poly, pc))
         return out
 
     def _candidates(self, face):
@@ -540,9 +583,25 @@ class Model:
         if len(cand) == 1:
             return [(face, cand[0])]
 
-        # sample the face: centroid plus boundary vertices
+        # sample the face: representative point, boundary vertices, and edge
+        # midpoints. A surface can dip below the assigned one strictly inside
+        # an edge, and vertex-only sampling never sees it.
         pts = [face.representative_point().coords[0]]
-        pts += list(face.exterior.coords)[:-1]
+        ext = list(face.exterior.coords)
+        pts += ext[:-1]
+        for i in range(len(ext) - 1):
+            pts.append(((ext[i][0] + ext[i + 1][0]) / 2.0,
+                        (ext[i][1] + ext[i + 1][1]) / 2.0))
+        # The conical is a convex function, so it can dip below a plane in
+        # the middle of a face while sitting above it along the whole
+        # boundary. Boundary sampling alone never sees that dip; a coarse
+        # interior grid does, and the contour split then finds the exact
+        # crossing curve.
+        minx, miny, maxx, maxy = face.bounds
+        for gx in np.linspace(minx, maxx, 7)[1:-1]:
+            for gy in np.linspace(miny, maxy, 7)[1:-1]:
+                if face.contains(Point(gx, gy)):
+                    pts.append((float(gx), float(gy)))
         winners = set()
         for x, y in pts:
             best, who = None, None
@@ -552,26 +611,35 @@ class Model:
                     best, who = z, pc
             winners.add(id(who))
 
-        if len(winners) == 1 or depth >= 3:
+        if len(winners) == 1 or depth >= 8:
             x, y = face.representative_point().coords[0]
             who = min(cand, key=lambda pc: pc.z(x, y))
             return [(face, who)]
 
-        # two or more surfaces cross inside this face: cut on the crossing
-        top = [pc for pc in cand if id(pc) in winners][:2]
-        cut = self._crossing(face, top[0], top[1])
-        if cut is None:
-            x, y = face.representative_point().coords[0]
-            return [(face, min(cand, key=lambda pc: pc.z(x, y)))]
-        parts = []
-        try:
-            for piece in shp_split(face, cut).geoms:
-                if piece.area > 25.0:
-                    parts.extend(self._assign(piece, depth + 1))
-        except Exception:
-            x, y = face.representative_point().coords[0]
-            return [(face, min(cand, key=lambda pc: pc.z(x, y)))]
-        return parts or [(face, top[0])]
+        # Two or more surfaces are lowest somewhere in this face. Try every
+        # winning pair until a cut actually divides it: with several
+        # overlapping corridors, the first pair's crossing can lie entirely
+        # outside the face, and shp_split hands the face back whole.
+        tops = [pc for pc in cand if id(pc) in winners]
+        for ai in range(len(tops)):
+            for bi in range(ai + 1, len(tops)):
+                cut = self._crossing(face, tops[ai], tops[bi])
+                if cut is None:
+                    continue
+                try:
+                    pieces = list(shp_split(face, cut).geoms)
+                except Exception:
+                    continue
+                if len(pieces) < 2:
+                    continue
+                parts = []
+                for piece in pieces:
+                    if piece.area > 4.0:
+                        parts.extend(self._assign(piece, depth + 1))
+                if parts:
+                    return parts
+        x, y = face.representative_point().coords[0]
+        return [(face, min(cand, key=lambda pc: pc.z(x, y)))]
 
     def _crossing(self, face, A, B):
         """Line or curve where two surfaces are at equal elevation."""
@@ -653,8 +721,9 @@ def to_geojson(model, composite=None):
                 "properties": props}
 
     def props(pc):
-        p = {"kind": pc.kind, "label": pc.label,
-             "color": COLORS.get(pc.kind, "#888888")}
+        dk = display_kind(pc.kind)
+        p = {"kind": dk, "label": pc.label,
+             "color": COLORS.get(dk, "#888888")}
         if pc.plane:
             p["plane"] = list(pc.plane)
         else:
@@ -663,13 +732,14 @@ def to_geojson(model, composite=None):
 
     layers = {}
     for pc in model.pieces:
-        layers.setdefault(pc.kind, []).append(feat(pc.poly, props(pc)))
+        layers.setdefault(display_kind(pc.kind), []).append(
+            feat(pc.poly, props(pc)))
     comp, outlines = [], []
     if composite:
         by_kind = {}
         for poly, pc in composite:
             comp.append(feat(poly, props(pc)))
-            by_kind.setdefault(pc.kind, []).append(poly)
+            by_kind.setdefault(display_kind(pc.kind), []).append(poly)
         # Every atomic face has its own edges, and drawing all of them buries
         # the map in interior lines. Dissolve the faces of each surface so only
         # the outline of the region it governs is stroked.
@@ -799,15 +869,103 @@ def _split_quadrants(poly):
     return parts
 
 
-def to_mesh3d(model, composite=None, use_composite=False):
+def mesh_polys(model, pc, poly, step=200.0):
+    """Polygons to triangulate for one piece of one surface.
+
+    Planar surfaces triangulate as they are: any chord across a plane still
+    lies in the plane. The conical is curved, and a triangle whose vertices
+    all sit near the rim spans the bowl at rim height — up to 175 ft above
+    the true surface on a face the size of the conical ring. Cutting the
+    polygon into concentric bands off the horizontal boundary puts vertices
+    on offset rings every `step` ft of radius, and the residual chord error
+    drops to inches.
+    """
+    if pc.plane is not None:
+        return [poly]
+    if getattr(model, "_bands", None) is None or model._band_step != step:
+        bands, prev, k = [], model.hpoly, 0
+        while k * step < CONE_HORIZ - 1e-6:
+            outer = model.hpoly.buffer(min((k + 1) * step, CONE_HORIZ),
+                                       quad_segs=64)
+            bands.append(outer.difference(prev))
+            prev = outer
+            k += 1
+        model._bands, model._band_step = bands, step
+    out = []
+    for band in model._bands:
+        cut = poly.intersection(band)
+        out.extend(pg for pg in as_polygons(cut) if pg.area > 1.0)
+    return out or [poly]
+
+
+def triangulate_conical(model, poly):
+    """Delaunay over the polygon boundary plus interior points seeded on the
+    conical offset rings. Ear clipping is exact for planes but free to draw
+    a 3,000 ft diagonal along the rim of a curved surface, and that chord
+    sags almost 100 ft in plan — a 5 ft elevation lie. Delaunay keeps edges
+    short and ring-aligned, so chords sag inches. Coverage is verified by
+    area; on any shortfall the banded ear clip takes over."""
+    from matplotlib.tri import Triangulation
+    pts = [np.asarray(poly.exterior.coords)[:-1]]
+    for r in poly.interiors:
+        pts.append(np.asarray(r.coords)[:-1])
+    for band in model._bands or []:
+        ring = band.exterior
+        arc = np.asarray(ring.coords)
+        seg = np.hypot(*np.diff(arc, axis=0).T)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        want = np.arange(0.0, cum[-1], 250.0)
+        xs = np.interp(want, cum, arc[:, 0])
+        ys = np.interp(want, cum, arc[:, 1])
+        keep = [(x, y) for x, y in zip(xs, ys)
+                if poly.contains(Point(x, y))]
+        if keep:
+            pts.append(np.asarray(keep))
+    P = np.vstack(pts)
+    if len(P) < 3:
+        return None
+    try:
+        tri = Triangulation(P[:, 0], P[:, 1])
+    except Exception:
+        return None
+    out, cover = [], 0.0
+    for a, b, c in tri.triangles:
+        t = P[[a, b, c]]
+        if poly.covers(Point(t[:, 0].mean(), t[:, 1].mean())):
+            out.append(t)
+            cover += abs((t[1][0]-t[0][0])*(t[2][1]-t[0][1]) -
+                         (t[1][1]-t[0][1])*(t[2][0]-t[0][0])) / 2.0
+    if abs(cover - poly.area) > max(poly.area, 1.0) * 1e-6:
+        return None
+    return out
+
+
+def to_mesh3d(model, composite=None, use_composite=False, merge=True):
     """Triangles in local feet, grouped by surface, for the 3D view."""
     groups = {}
 
-    def add(kind, poly, z_at):
+    def add(kind, poly, z_at, pc=None):
+        kind = display_kind(kind, merge)
         if poly.is_empty:
             return
-        polys = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
         buf = groups.setdefault(kind, [])
+        polys = []
+        for pg0 in as_polygons(poly):
+            if pc is not None and pc.plane is None:
+                mesh_polys(model, pc, pg0)      # ensures rings are cached
+                tris = triangulate_conical(model, pg0)
+                if tris is not None:
+                    for t in tris:
+                        for x, y in t:
+                            buf.extend([round(float(x), 1),
+                                        round(float(y), 1),
+                                        round(float(z_at(x, y)), 2)])
+                    continue
+                polys.extend(mesh_polys(model, pc, pg0))
+            elif pc is not None:
+                polys.extend(mesh_polys(model, pc, pg0))
+            else:
+                polys.append(pg0)
         for pg in polys:
             for t in triangulate(pg):
                 for x, y in t:
@@ -816,12 +974,12 @@ def to_mesh3d(model, composite=None, use_composite=False):
 
     if use_composite and composite:
         for poly, pc in composite:
-            add("COMPOSITE:" + pc.kind, poly, pc.z)
+            add("COMPOSITE:" + pc.kind, poly, pc.z, pc)
     else:
         fbp = model.faces_by_piece()
         for i, pc in enumerate(model.pieces):
             for face in fbp.get(i, []):
-                add(pc.kind, face, pc.z)
+                add(pc.kind, face, pc.z, pc)
     for f in model.frames:
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
                         f.world(f.half, -f.rwy.width / 2),
@@ -835,7 +993,7 @@ def to_mesh3d(model, composite=None, use_composite=False):
     edges = {}
 
     def add_edge(kind, poly, z_at):
-        buf = edges.setdefault(kind, [])
+        buf = edges.setdefault(display_kind(kind, merge), [])
         for pg in as_polygons(poly):
             for ring in [pg.exterior] + list(pg.interiors):
                 c = list(ring.coords)
@@ -847,15 +1005,20 @@ def to_mesh3d(model, composite=None, use_composite=False):
     if use_composite and composite:
         by = {}
         for poly, pc in composite:
-            by.setdefault(pc.kind, []).append((poly, pc))
+            by.setdefault(display_kind(pc.kind, merge), []).append((poly, pc))
         for kind, items in by.items():
             merged = unary_union([p.buffer(0.5) for p, _ in items]).buffer(-0.5)
             _, pc0 = items[0]
             for pg in as_polygons(merged):
                 add_edge("COMPOSITE:" + kind, pg, pc0.z)
     else:
+        by = {}
         for pc in model.pieces:
-            add_edge(pc.kind, pc.poly, pc.z)
+            by.setdefault(display_kind(pc.kind, merge), []).append(pc)
+        for kind, pcs in by.items():
+            merged = unary_union([pc.poly.buffer(0.5) for pc in pcs]).buffer(-0.5)
+            for pg in as_polygons(merged):
+                add_edge(kind, pg, pcs[0].z)
     for f in model.frames:
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
                         f.world(f.half, -f.rwy.width / 2),
@@ -910,11 +1073,32 @@ def to_dxf(model, composite=None, epsg=None):
         return n
 
     stats = {}
+    def emit_piece(pc, poly, lay):
+        n = 0
+        for pg0 in as_polygons(poly):
+            if pc.plane is None:
+                mesh_polys(model, pc, pg0)
+                tris = triangulate_conical(model, pg0)
+                if tris is not None:
+                    for t in tris:
+                        out = []
+                        for x, y in t:
+                            zz = pc.z(x, y)
+                            X, Y = xf(x, y) if xf else (x, y)
+                            out.append((X, Y, zz))
+                        out.append(out[2])
+                        msp.add_3dface(out, dxfattribs={"layer": lay})
+                        n += 1
+                    continue
+            for pg in mesh_polys(model, pc, pg0):
+                n += emit(pg, pc.z, lay)
+        return n
+
     fbp = model.faces_by_piece()
     for i, pc in enumerate(model.pieces):
         lay = "P77-%s" % pc.kind
         for face in fbp.get(i, []):
-            stats[lay] = stats.get(lay, 0) + emit(face, pc.z, lay)
+            stats[lay] = stats.get(lay, 0) + emit_piece(pc, face, lay)
     for f in model.frames:
         lay = "P77-RUNWAY-%s" % f.rwy.id.replace("/", "-")
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
@@ -926,7 +1110,7 @@ def to_dxf(model, composite=None, epsg=None):
     if composite:
         for poly, pc in composite:
             stats["P77-COMPOSITE"] = stats.get("P77-COMPOSITE", 0) + \
-                emit(poly, pc.z, "P77-COMPOSITE")
+                emit_piece(pc, poly, "P77-COMPOSITE")
 
     buf = io.StringIO()
     doc.write(buf)

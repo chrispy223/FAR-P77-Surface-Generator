@@ -52,9 +52,16 @@ def _f(v, default=None):
         return default
 
 
-def _code(v):
-    v = (v or "").strip().upper()
-    return v if v in C.PART77 else "B(V)"
+MISSING_CODES = []
+
+
+def _code(v, end=None):
+    raw = (v or "").strip().upper()
+    if raw in C.PART77:
+        return raw
+    if end:
+        MISSING_CODES.append((end, raw or "(blank)"))
+    return "B(V)"
 
 
 def fetch_adip(loc, url=ADIP_URL):
@@ -72,6 +79,7 @@ def fetch_adip(loc, url=ADIP_URL):
 
 
 def adip_to_rows(rec):
+    MISSING_CODES.clear()
     rows = []
     for rw in rec.get("runways", []):
         b, r = rw.get("baseEnd", {}), rw.get("reciprocalEnd", {})
@@ -83,11 +91,13 @@ def adip_to_rows(rec):
             "End 1": b.get("runwayEndId"),
             "Lat 1": _f(b.get("latitude")), "Lon 1": _f(b.get("longitude")),
             "Elev 1": _f(b.get("elevation")),
-            "Cat 1": CAT_LABELS[_code(b.get("obstaclePart77"))],
+            "Cat 1": CAT_LABELS[_code(b.get("obstaclePart77"),
+                                      b.get("runwayEndId"))],
             "End 2": r.get("runwayEndId"),
             "Lat 2": _f(r.get("latitude")), "Lon 2": _f(r.get("longitude")),
             "Elev 2": _f(r.get("elevation")),
-            "Cat 2": CAT_LABELS[_code(r.get("obstaclePart77"))],
+            "Cat 2": CAT_LABELS[_code(r.get("obstaclePart77"),
+                                      r.get("runwayEndId"))],
         })
     return rows
 
@@ -255,6 +265,12 @@ if conflicts:
                % len(conflicts))
     st.dataframe(pd.DataFrame(conflicts), use_container_width=True,
                  hide_index=True)
+
+if MISSING_CODES:
+    st.warning("ADIP has no Part 77 category for: " +
+               ", ".join("%s (%s)" % mc for mc in MISSING_CODES) +
+               ". Defaulted to visual — verify these before generating, the "
+               "way you would against the approach charts.")
 
 st.subheader("Runway configuration")
 st.caption("Everything below is editable. Add a row for a proposed runway, or "
