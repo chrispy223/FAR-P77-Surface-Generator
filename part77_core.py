@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.19"
+__version__ = "v20"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -467,29 +467,45 @@ class Model:
         x, y = f.world(s, side * half)
         return not self.cpoly.covers(Point(x, y))
 
+    def trans_ceiling(self, x, y):
+        """Elevation the transitional terminates against.
+
+        77.19(e) runs the transitional up to the horizontal surface, which
+        is a plane 150 ft above the established airport elevation. It does
+        not chase the conical: where the approach edge has already climbed
+        past that plane the transitional has nothing left to reach and does
+        not exist. Terminating against the conical instead fills the band
+        just inside the conical limit with a narrow strip rising to +350,
+        which reads as a wall in 3D and does not appear on the reference
+        drawings.
+        """
+        p = Point(x, y)
+        if self.hpoly.covers(p) or self.cpoly.covers(p):
+            return self.horiz_z
+        return None
+
     def _trans_run(self, f, e, s, side, half, z_in):
         """Outward run of the transitional at this station.
 
         Inside the conical limit the transitional rises 7:1 and terminates
-        where it meets the horizontal or conical surface. Once the approach
-        has climbed above both there is nothing left to terminate against and
-        the transitional simply ends. Only past the conical limit does the
-        flat 5,000 ft extension of 77.19(d) apply, and only for a precision
-        approach.
+        on the horizontal surface elevation. Once the approach has climbed
+        above it there is nothing to terminate against and the transitional
+        simply ends. Only past the conical limit does the flat 5,000 ft
+        extension of 77.19(d) apply, and only for a precision approach.
         """
         if self.beyond_conical(f, s, side, half):
             return 0.0
 
         def above(run):
             x, y = f.world(s, side * (half + run))
-            ceil = self.hc_ceiling(x, y)
+            ceil = self.trans_ceiling(x, y)
             if ceil is None:
                 return True
             return z_in + run / TRANS_SLOPE >= ceil
 
         if above(0.0):
             return 0.0
-        hi = (self.cone_z - z_in) * TRANS_SLOPE + CONE_HORIZ
+        hi = max(0.0, self.horiz_z - z_in) * TRANS_SLOPE
         if not above(hi):
             return hi
         lo = 0.0
@@ -1170,7 +1186,116 @@ def tin_name(pc, merge=True):
            "P77-%s-%s" % (rwy, kind)
 
 
-def tin_groups(model, composite=None, individual=True, use_composite=False):
+# ===========================================================================
+# Grouped composite export (v20)
+#
+# The composite as one TIN ramps across every vertical step, because a TIN
+# holds one elevation per plan position and cannot carry a cliff. Splitting
+# it into four groups turns each cliff into a gap *between* surfaces instead
+# of a ramp *within* one. Every group is cut from composite faces, which are
+# already a mutually exclusive lower envelope, so each group is single
+# valued and internally continuous with no new geometry.
+#
+#   INNER RWY SURF   primary + transitional + approach below the horizontal
+#   <end> OUTER APR   approach + its 5,000 ft wings above the horizontal
+#   HORIZONTAL        as-is
+#   CONICAL           as-is
+#
+# The inner/outer split is by elevation against the horizontal, not by the
+# approach's 10,000 ft slope break. An approach leaves the inner group where
+# it pierces the horizontal, the horizontal and then the conical own the
+# band above, and the approach resurfaces where it drops back below the
+# conical. Those crossings are already composite face boundaries, so testing
+# a face against the horizontal elevation never splits anything.
+# ===========================================================================
+GROUP_INNER = "INNER RWY SURF"
+GROUP_HORIZONTAL = "HORIZONTAL"
+GROUP_CONICAL = "CONICAL"
+APPROACH_FAMILY = ("APPROACH", "APPROACH2", "TRANSITIONAL5000")
+
+_SIDE_ORDER = {"L": 0, "C": 1, "R": 2, "": 3}
+
+
+def _end_parts(end_id):
+    """Split '04R' into its designator and side: ('4', 'R')."""
+    e = (end_id or "").strip().upper()
+    i = len(e)
+    while i > 0 and e[i - 1] in "LRC":
+        i -= 1
+    return (e[:i].lstrip("0") or e[:i] or "?"), e[i:]
+
+
+def _end_display(end_id):
+    n, s = _end_parts(end_id)
+    return n + s
+
+
+def approach_group_name(end_ids):
+    """'28L/28R OUTER APR' for a parallel pair, '4R OUTER APR' for one end."""
+    ends = sorted(set(end_ids),
+                  key=lambda e: (_SIDE_ORDER.get(_end_parts(e)[1], 9), e))
+    return "%s OUTER APR" % "/".join(_end_display(e) for e in ends)
+
+
+def _face_min_z(pc, poly):
+    return min(pc.z(x, y) for x, y in poly.exterior.coords)
+
+
+def composite_groups(model, composite=None, tol=0.5):
+    """Composite faces bucketed into the four export surfaces.
+
+    Parallel ends share a bucket because they share a designator: 28L and
+    28R both reduce to '28'. Where two approach surfaces overlap in plan the
+    composite has already resolved them to the lower one, so the higher
+    surface carries a bite out of its side rather than folding over itself.
+
+    The outer group is keyed on kind, not elevation. A runway end can sit
+    below the established airport elevation — BNA 20L is 540 against an
+    airport elevation of 599 — and then the outer approach segment begins
+    below the horizontal and climbs through it. Elevation alone would file
+    those faces as inner. The elevation test survives only as an escape for
+    an inner-family face that lies wholly above the horizontal.
+    """
+    if composite is None:
+        composite = model.composite()
+    inner, horizontal, conical = [], [], []
+    outer, outer_ends = {}, {}
+    for poly, pc in composite:
+        if pc.kind == "HORIZONTAL":
+            horizontal.append((poly, pc))
+        elif pc.kind == "CONICAL":
+            conical.append((poly, pc))
+        elif (pc.kind in ("APPROACH2", "TRANSITIONAL5000")
+                or (pc.kind in ("APPROACH", "TRANSITIONAL")
+                    and _face_min_z(pc, poly) > model.horiz_z + tol)):
+            end = piece_end(pc) or "?"
+            num = _end_parts(end)[0]
+            outer.setdefault(num, []).append((poly, pc))
+            outer_ends.setdefault(num, set()).add(end)
+        else:
+            inner.append((poly, pc))
+
+    out = {}
+    if inner:
+        out[GROUP_INNER] = inner
+    if horizontal:
+        out[GROUP_HORIZONTAL] = horizontal
+    if conical:
+        out[GROUP_CONICAL] = conical
+    for num, items in outer.items():
+        out[approach_group_name(outer_ends[num])] = items
+    return out
+
+
+def dxf_layer(name):
+    """DXF forbids / \\ : ; * ? \" < > | in a layer name."""
+    for ch in "/\\:;*?\"<>|":
+        name = name.replace(ch, "-")
+    return "P77-" + name.replace(" ", "-")
+
+
+def tin_groups(model, composite=None, individual=True, use_composite=False,
+               use_groups=False):
     """Triangles grouped into sets that are each valid as a TIN.
 
     A TIN holds one elevation per plan position, so a group must not fold
@@ -1194,6 +1319,10 @@ def tin_groups(model, composite=None, individual=True, use_composite=False):
         for i, pc in enumerate(model.pieces):
             for face in fbp.get(i, []):
                 add(tin_name(pc), face, pc)
+    if use_groups:
+        for name, items in composite_groups(model, composite).items():
+            for poly, pc in items:
+                add(name, poly, pc)
     if use_composite and composite:
         for poly, pc in composite:
             add("P77-COMPOSITE", poly, pc)
@@ -1201,7 +1330,7 @@ def tin_groups(model, composite=None, individual=True, use_composite=False):
 
 
 def to_landxml(model, composite=None, epsg=None, individual=True,
-               use_composite=True):
+               use_composite=True, use_groups=False):
     """LandXML 1.2 TIN surfaces.
 
     Civil 3D imports these as surfaces directly. A DXF carries 3DFACE
@@ -1221,7 +1350,8 @@ def to_landxml(model, composite=None, epsg=None, individual=True,
            "<Application name='FAR Part 77 Surface Generator' "
            "version='%s'/>" % __version__,
            "<Surfaces>"]
-    groups = tin_groups(model, composite, individual, use_composite)
+    groups = tin_groups(model, composite, individual, use_composite,
+                        use_groups)
     for name, tris in sorted(groups.items()):
         ids, pts, faces = {}, [], []
         for t in tris:
@@ -1263,7 +1393,7 @@ def to_landxml(model, composite=None, epsg=None, individual=True,
 
 # ===========================================================================
 def to_dxf(model, composite=None, epsg=None, individual=True,
-           use_composite=True):
+           use_composite=True, use_groups=False):
     import ezdxf
     doc = ezdxf.new("R2010", setup=True)
     doc.header["$INSUNITS"] = 2
@@ -1321,6 +1451,11 @@ def to_dxf(model, composite=None, epsg=None, individual=True,
                         f.world(-f.half, f.rwy.width / 2)])
         stats[lay] = stats.get(lay, 0) + emit(
             poly, lambda x, y, f=f: f.centerline_z(f.local(x, y)[0]), lay)
+    if use_groups:
+        for name, items in composite_groups(model, composite).items():
+            lay = dxf_layer(name)
+            for poly, pc in items:
+                stats[lay] = stats.get(lay, 0) + emit_piece(pc, poly, lay)
     if use_composite and composite:
         for poly, pc in composite:
             stats["P77-COMPOSITE"] = stats.get("P77-COMPOSITE", 0) + \

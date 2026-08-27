@@ -46,6 +46,70 @@ def trans_gaps(m):
     return holes == 0, "(%d holes across %d strips)" % (holes, total)
 
 
+def group_checks(m, comp):
+    """The four export groups must partition the composite exactly.
+
+    A group that loses area has a hole; a group that gains it double-covers,
+    which a TIN cannot hold. Both are invisible in 3D and obvious as cuts or
+    folds once the surface is built in Civil 3D.
+    """
+    from shapely.ops import unary_union
+    g = C.composite_groups(m, comp)
+    total = sum(p.area for p, _ in comp)
+    ga = sum(p.area for items in g.values() for p, _ in items)
+    chk("groups conserve composite area",
+        abs(ga - total) / max(total, 1.0) < 1e-9,
+        "(%.4e vs %.4e)" % (ga, total))
+
+    nface = sum(len(v) for v in g.values())
+    chk("every composite face lands in exactly one group",
+        nface == len(comp), "(%d of %d)" % (nface, len(comp)))
+
+    # Each group must be single valued: its faces may not overlap in plan.
+    # Tested pairwise, not by unary_union area, which loses thousands of
+    # square feet to rounding when it dissolves a few hundred faces at state
+    # plane magnitudes and reads as an overlap that is not there.
+    from shapely.strtree import STRtree
+    worst = 0.0
+    for name, items in g.items():
+        polys = [p for p, _ in items]
+        tree = STRtree(polys)
+        for i, p in enumerate(polys):
+            for j in tree.query(p):
+                if j > i:
+                    worst = max(worst, p.intersection(polys[j]).area)
+    chk("no group folds over itself in plan", worst < 1.0,
+        "(worst pair overlap %.3f sf)" % worst)
+
+    # No outer-approach piece may sit in the inner group: the inner group is
+    # the below-horizontal set by definition.
+    stray = [pc.kind for p, pc in g.get(C.GROUP_INNER, [])
+             if pc.kind in ("APPROACH2", "TRANSITIONAL5000")
+             and min(pc.z(x, y) for x, y in p.exterior.coords) > m.horiz_z + 0.5]
+    chk("no outer-approach face lands in the inner group", not stray,
+        "(%d stray)" % len(stray))
+
+    # The inner group is the below-horizontal set by definition. Before v20
+    # the transitional terminated against the conical where the approach edge
+    # lay outside the horizontal perimeter, which pushed a narrow strip of it
+    # up to +350 and read as a wall in 3D. It now stops on the horizontal
+    # elevation and that band is carried by the 5,000 ft wing instead.
+    hi = 0.0
+    for p, pc in g.get(C.GROUP_INNER, []):
+        hi = max(hi, max(pc.z(x, y) for x, y in p.exterior.coords))
+    chk("inner group stays at or below the horizontal", hi <= m.horiz_z + 0.5,
+        "(max %.2f vs horizontal %.2f)" % (hi, m.horiz_z))
+
+    # An outer group holds only outer-approach geometry. It is NOT required
+    # to sit above the horizontal: where a runway end is below the airport
+    # elevation the outer segment starts under it and climbs through.
+    for name in sorted(g):
+        if name.endswith("OUTER APR"):
+            kinds = set(pc.kind for _, pc in g[name])
+            chk("%s holds only outer-approach geometry" % name,
+                kinds <= set(C.APPROACH_FAMILY), "(%s)" % ", ".join(sorted(kinds)))
+
+
 def chk(label, ok, detail=""):
     print("  %s  %s %s" % ("PASS" if ok else "FAIL", label, detail))
     if not ok:
@@ -115,6 +179,7 @@ for poly, pc in comp:
     if who is not pc and abs(pc.z(x, y) - z) > 0.5:
         bad += 1
 chk("composite faces match controlling()", bad == 0, "(%d off)" % bad)
+group_checks(m, comp)
 
 # meshes: watertight per polygon, by area
 worst = 0.0
@@ -164,6 +229,7 @@ def airport_checks(path):
         "(worst %.1e)" % worst)
 
     chk("transitional coverage has no gaps", *trans_gaps(m))
+    group_checks(m, comp)
 
     # every piece must be fully tiled by its arrangement faces: a dropped
     # face leaves a hole that shows as a cut in an exported TIN border

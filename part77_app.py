@@ -507,7 +507,7 @@ st.caption("DXF carries 3DFACE entities on layers. LandXML carries TIN "
            "surfaces, which Civil 3D imports as surfaces directly rather "
            "than something you rebuild by hand. Each surface is named for "
            "the runway end and surface it belongs to.")
-x1, x2, x3, x4 = st.columns([1.1, 1.1, 1, 1])
+x1, x2, x3, x4, x5 = st.columns([1.1, 1.1, 1, 1, 1])
 fmt = x1.radio("Format", ["LandXML (TIN surfaces)", "DXF (3DFACE)"],
                label_visibility="collapsed")
 crs_opts = crs_choices(model.lf.lat0, model.lf.lon0)
@@ -517,17 +517,24 @@ choice = x2.selectbox("Coordinate system", list(crs_opts.keys()),
 epsg = crs_opts[choice] or ""
 if choice.startswith("Other"):
     epsg = x2.text_input("EPSG code", value="", placeholder="e.g. 3452")
-inc_ind = x3.checkbox("Individual surfaces", value=True)
-inc_comp = x4.checkbox("Composite", value=True)
+inc_ind = x3.checkbox("Individual surfaces", value=False)
+inc_grp = x4.checkbox("Grouped composite", value=True,
+                      help="Four surfaces: inner, outer approach per end, "
+                           "horizontal, conical. Each is continuous, so the "
+                           "vertical steps become gaps between surfaces "
+                           "instead of ramps inside one.")
+inc_comp = x5.checkbox("Single composite", value=False,
+                       help="The whole envelope as one TIN. A TIN cannot "
+                            "hold a cliff, so this ramps across every step.")
 
 split = st.checkbox(
-    "Separate files for individual surfaces and composite", value=False,
-    help="Off: one file holding everything. On: two downloads, so the "
-         "composite can be brought into a drawing on its own.")
+    "Separate files per selection", value=False,
+    help="Off: one file holding everything. On: a download per selection, "
+         "so a set can be brought into a drawing on its own.")
 
 if st.button("Build export", type="primary"):
-    if not (inc_ind or inc_comp):
-        st.error("Select individual surfaces, the composite, or both.")
+    if not (inc_ind or inc_grp or inc_comp):
+        st.error("Select at least one of the three surface sets.")
     else:
         tag = apt["locId"] or "airport"
         landxml = fmt.startswith("LandXML")
@@ -535,15 +542,17 @@ if st.button("Build export", type="primary"):
         mime = "application/xml" if landxml else "application/dxf"
         code = epsg.strip() or None
 
-        def build(want_ind, want_comp):
+        def build(want_ind, want_comp, want_grp=False):
             if landxml:
                 data = C.to_landxml(model, comp, code, individual=want_ind,
-                                    use_composite=want_comp)
+                                    use_composite=want_comp,
+                                    use_groups=want_grp)
                 names = sorted(C.tin_groups(model, comp, want_ind,
-                                            want_comp).keys())
+                                            want_comp, want_grp).keys())
                 return data, names, None
             data, stats = C.to_dxf(model, comp, code, individual=want_ind,
-                                   use_composite=want_comp)
+                                   use_composite=want_comp,
+                                   use_groups=want_grp)
             return data, None, stats
 
         def show(label, fname, data, names, stats):
@@ -564,16 +573,21 @@ if st.button("Build export", type="primary"):
                     if inc_ind:
                         jobs.append(("Individual surfaces",
                                      "%s_Part77_Surfaces.%s" % (tag, ext),
-                                     True, False))
+                                     True, False, False))
+                    if inc_grp:
+                        jobs.append(("Grouped composite",
+                                     "%s_Part77_Grouped.%s" % (tag, ext),
+                                     False, False, True))
                     if inc_comp:
-                        jobs.append(("Composite",
+                        jobs.append(("Single composite",
                                      "%s_Part77_Composite.%s" % (tag, ext),
-                                     False, True))
+                                     False, True, False))
                 else:
                     jobs.append(("TIN surface",
                                  "%s_Part77.%s" % (tag, ext),
-                                 inc_ind, inc_comp))
-                built = [(lbl, fn) + build(wi, wc) for lbl, fn, wi, wc in jobs]
+                                 inc_ind, inc_comp, inc_grp))
+                built = [(lbl, fn) + build(wi, wc, wg)
+                         for lbl, fn, wi, wc, wg in jobs]
             for lbl, fn, data, names, stats in built:
                 if split:
                     st.markdown("**%s**" % lbl)
