@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.13"
+__version__ = "2026-08-21.14"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -1084,8 +1084,129 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
             "cone_z": model.cone_z}
 
 
+def _projector(model, epsg):
+    """World transform for export, or None to stay in local feet."""
+    if not epsg:
+        return None
+    from pyproj import CRS, Transformer
+    crs = CRS.from_epsg(int(epsg))
+    unit = crs.axis_info[0].unit_name.lower()
+    k = 1.0 if ("foot" in unit or "feet" in unit) else 1.0 / US_FT
+    tr = Transformer.from_crs(CRS.from_epsg(4326), crs, always_xy=True)
+
+    def xf(x, y):
+        lat, lon = model.lf.inv(x, y)
+        px, py = tr.transform(lon, lat)
+        return px * k, py * k
+
+    return xf
+
+
+def piece_end(pc):
+    """Runway end a piece belongs to, read back off its label."""
+    parts = (pc.label or "").split()
+    if len(parts) >= 3 and parts[1] in ("approach", "transitional"):
+        return parts[2]
+    return None
+
+
+def tin_name(pc, merge=True):
+    """Surface name carrying the runway and end it applies to."""
+    kind = display_kind(pc.kind, merge)
+    if not pc.runway:
+        return "P77-%s" % kind
+    rwy = pc.runway.replace("/", "-")
+    end = piece_end(pc)
+    return "P77-%s-%s-%s" % (rwy, end, kind) if end else \
+           "P77-%s-%s" % (rwy, kind)
+
+
+def tin_groups(model, composite=None, individual=True, use_composite=False):
+    """Triangles grouped into sets that are each valid as a TIN.
+
+    A TIN holds one elevation per plan position, so a group must not fold
+    over itself. Surfaces are split per runway end for that reason: two
+    runways' approach surfaces routinely overlap in plan at different
+    elevations, and merging them would be wrong wherever they cross. The
+    composite is a lower envelope, so it is single valued by construction.
+    """
+    out = {}
+
+    def add(name, poly, pc):
+        tris = out.setdefault(name, [])
+        for pg0 in as_polygons(poly):
+            for pg in mesh_polys(model, pc, pg0):
+                for t in triangulate(pg):
+                    tris.append([(float(x), float(y), float(pc.z(x, y)))
+                                 for x, y in t])
+
+    if individual:
+        fbp = model.faces_by_piece()
+        for i, pc in enumerate(model.pieces):
+            for face in fbp.get(i, []):
+                add(tin_name(pc), face, pc)
+    if use_composite and composite:
+        for poly, pc in composite:
+            add("P77-COMPOSITE", poly, pc)
+    return {k: v for k, v in out.items() if v}
+
+
+def to_landxml(model, composite=None, epsg=None, individual=True,
+               use_composite=True):
+    """LandXML 1.2 TIN surfaces.
+
+    Civil 3D imports these as surfaces directly. A DXF carries 3DFACE
+    entities instead, which have to be rebuilt into a surface by hand.
+    """
+    import datetime
+
+    xf = _projector(model, epsg)
+    now = datetime.datetime.now()
+    buf = ["<?xml version='1.0' encoding='UTF-8'?>",
+           "<LandXML xmlns='http://www.landxml.org/schema/LandXML-1.2' "
+           "version='1.2' date='%s' time='%s'>"
+           % (now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")),
+           "<Units><Imperial areaUnit='squareFoot' "
+           "linearUnit='USSurveyFoot' volumeUnit='cubicFeet' "
+           "temperatureUnit='fahrenheit' pressureUnit='inHG'/></Units>",
+           "<Application name='FAR Part 77 Surface Generator' "
+           "version='%s'/>" % __version__,
+           "<Surfaces>"]
+    groups = tin_groups(model, composite, individual, use_composite)
+    for name, tris in sorted(groups.items()):
+        ids, pts, faces = {}, [], []
+        for t in tris:
+            f = []
+            for x, y, z in t:
+                X, Y = xf(x, y) if xf else (x, y)
+                key = (round(X, 4), round(Y, 4), round(z, 4))
+                n = ids.get(key)
+                if n is None:
+                    n = len(pts) + 1
+                    ids[key] = n
+                    pts.append(key)
+                f.append(n)
+            if len(set(f)) == 3:
+                faces.append(f)
+        if not faces:
+            continue
+        buf.append("<Surface name='%s' desc='14 CFR Part 77.19'>"
+                   "<Definition surfType='TIN'>" % name)
+        buf.append("<Pnts>")
+        for i, (X, Y, z) in enumerate(pts, 1):
+            # LandXML orders a point northing, easting, elevation
+            buf.append("<P id='%d'>%.4f %.4f %.4f</P>" % (i, Y, X, z))
+        buf.append("</Pnts><Faces>")
+        for f in faces:
+            buf.append("<F>%d %d %d</F>" % tuple(f))
+        buf.append("</Faces></Definition></Surface>")
+    buf.append("</Surfaces></LandXML>")
+    return "\n".join(buf).encode("utf-8")
+
+
 # ===========================================================================
-def to_dxf(model, composite=None, epsg=None):
+def to_dxf(model, composite=None, epsg=None, individual=True,
+           use_composite=True):
     import ezdxf
     doc = ezdxf.new("R2010", setup=True)
     doc.header["$INSUNITS"] = 2
@@ -1130,10 +1251,11 @@ def to_dxf(model, composite=None, epsg=None):
         return n
 
     fbp = model.faces_by_piece()
-    for i, pc in enumerate(model.pieces):
-        lay = "P77-%s" % pc.kind
-        for face in fbp.get(i, []):
-            stats[lay] = stats.get(lay, 0) + emit_piece(pc, face, lay)
+    if individual:
+        for i, pc in enumerate(model.pieces):
+            lay = tin_name(pc, merge=False)
+            for face in fbp.get(i, []):
+                stats[lay] = stats.get(lay, 0) + emit_piece(pc, face, lay)
     for f in model.frames:
         lay = "P77-RUNWAY-%s" % f.rwy.id.replace("/", "-")
         poly = Polygon([f.world(-f.half, -f.rwy.width / 2),
@@ -1142,7 +1264,7 @@ def to_dxf(model, composite=None, epsg=None):
                         f.world(-f.half, f.rwy.width / 2)])
         stats[lay] = stats.get(lay, 0) + emit(
             poly, lambda x, y, f=f: f.centerline_z(f.local(x, y)[0]), lay)
-    if composite:
+    if use_composite and composite:
         for poly, pc in composite:
             stats["P77-COMPOSITE"] = stats.get("P77-COMPOSITE", 0) + \
                 emit_piece(pc, poly, "P77-COMPOSITE")

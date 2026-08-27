@@ -486,22 +486,49 @@ if S.get("obs_report"):
         "%d of %d obstacles penetrate a Part 77 surface." % (n, len(rep)))
 
 st.subheader("Export")
-x1, x2, x3 = st.columns([1.2, 1, 2])
-epsg = x1.text_input("EPSG for DXF (blank = local feet about the ARP)",
-                     value="")
-inc = x2.checkbox("Include composite layer", value=True)
-x3.write("")
-if x3.button("Build DXF", type="primary"):
-    with st.spinner("Writing DXF…"):
-        data, stats = C.to_dxf(model, comp if inc else None,
-                               epsg.strip() or None)
-    tag = apt["locId"] or "airport"
-    st.download_button("Download %s_Part77.dxf" % tag, data,
-                       file_name="%s_Part77.dxf" % tag,
-                       mime="application/dxf")
-    st.dataframe(pd.DataFrame(sorted(stats.items()),
-                              columns=["Layer", "3DFACE count"]),
-                 use_container_width=True, hide_index=True)
+st.caption("DXF carries 3DFACE entities on layers. LandXML carries TIN "
+           "surfaces, which Civil 3D imports as surfaces directly rather "
+           "than something you rebuild by hand. Each surface is named for "
+           "the runway end and surface it belongs to.")
+x1, x2, x3, x4 = st.columns([1.1, 1.1, 1, 1])
+fmt = x1.radio("Format", ["LandXML (TIN surfaces)", "DXF (3DFACE)"],
+               label_visibility="collapsed")
+epsg = x2.text_input("EPSG (blank = local feet about the ARP)", value="")
+inc_ind = x3.checkbox("Individual surfaces", value=True)
+inc_comp = x4.checkbox("Composite", value=True)
+
+if st.button("Build export", type="primary"):
+    if not (inc_ind or inc_comp):
+        st.error("Select individual surfaces, the composite, or both.")
+    else:
+        tag = apt["locId"] or "airport"
+        try:
+            with st.spinner("Writing export…"):
+                if fmt.startswith("LandXML"):
+                    data = C.to_landxml(model, comp, epsg.strip() or None,
+                                        individual=inc_ind,
+                                        use_composite=inc_comp)
+                    fname, mime = "%s_Part77.xml" % tag, "application/xml"
+                    names = sorted(C.tin_groups(model, comp, inc_ind,
+                                                inc_comp).keys())
+                    stats = None
+                else:
+                    data, stats = C.to_dxf(model, comp, epsg.strip() or None,
+                                           individual=inc_ind,
+                                           use_composite=inc_comp)
+                    fname, mime = "%s_Part77.dxf" % tag, "application/dxf"
+                    names = None
+            st.download_button("Download " + fname, data, file_name=fname,
+                               mime=mime)
+            if names:
+                st.dataframe(pd.DataFrame({"TIN surface": names}),
+                             use_container_width=True, hide_index=True)
+            if stats:
+                st.dataframe(pd.DataFrame(sorted(stats.items()),
+                                          columns=["Layer", "3DFACE count"]),
+                             use_container_width=True, hide_index=True)
+        except Exception as ex:
+            st.error("Export failed: %s" % ex)
 
 st.caption("Surfaces are 14 CFR Part 77.19 imaginary surfaces. The horizontal "
            "perimeter uses the 77.19(c) tangent-line construction. "
