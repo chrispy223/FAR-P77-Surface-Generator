@@ -137,10 +137,16 @@ def load_dtpp(upload):
 
 @st.cache_data(show_spinner=False)
 def crs_choices(lat, lon):
-    """Label -> EPSG code, for the export coordinate system picker."""
-    opts = {"Local feet about the ARP (no projection)": None}
+    """Label -> EPSG code for the export picker.
+
+    The best-fitting state plane zone leads, since an export nobody can
+    line up with their drawing is the less useful default. Local feet stays
+    available at the bottom for anyone who wants it.
+    """
+    opts = {}
     for c in C.suggest_crs(lat, lon):
         opts["%s — EPSG:%d" % (c["name"], c["code"])] = str(c["code"])
+    opts["Local feet about the ARP (no projection)"] = None
     opts["Other (enter an EPSG code)"] = None
     return opts
 
