@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.17"
+__version__ = "2026-08-21.19"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -552,18 +552,11 @@ class Model:
             for pc in self.pieces:
                 lines.extend(pc.poly.interiors)
             merged = unary_union(lines)
-            faces = []
-            for f in polygonize(merged):
-                if f.area <= 25.0:
-                    continue
-                # Nearly coincident boundaries (one runway's wing edge along
-                # another's approach edge) leave faces thousands of feet long
-                # and under a foot wide. They carry no area worth drawing, but
-                # edge-on under vertical exaggeration they render as fins.
-                if 4.0 * f.area / max(f.length, 1.0) < 1.0:
-                    continue
-                faces.append(f)
-            self._faces = faces
+            # Every face is kept. Dropping thin ones was left over from
+            # chasing 3D fins, whose real cause turned out to be conical
+            # chord error; all it does now is punch holes in the exported
+            # surfaces, which a TIN border makes obvious.
+            self._faces = [f for f in polygonize(merged) if f.area > 1e-6]
         return self._faces
 
     def faces_by_piece(self):
@@ -582,11 +575,7 @@ class Model:
         faces = self.arrangement()
         out = []
         for face in faces:
-            for poly, pc in self._assign(face, 0):
-                # splitting on crossing lines can create its own slivers
-                if 4.0 * poly.area / max(poly.length, 1.0) < 1.0:
-                    continue
-                out.append((poly, pc))
+            out.extend(self._assign(face, 0))
         return out
 
     def _candidates(self, face):
@@ -1246,8 +1235,16 @@ def to_landxml(model, composite=None, epsg=None, individual=True,
                     ids[key] = n
                     pts.append(key)
                 f.append(n)
-            if len(set(f)) == 3:
-                faces.append(f)
+            if len(set(f)) != 3:
+                continue
+            # Civil 3D flags zero-area faces when building the surface, so
+            # drop slivers that collapse once coordinates are rounded.
+            (ax, ay, _), (bx, by, _), (cx, cy, _) = (pts[f[0] - 1],
+                                                     pts[f[1] - 1],
+                                                     pts[f[2] - 1])
+            if abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) < 1e-6:
+                continue
+            faces.append(f)
         if not faces:
             continue
         buf.append("<Surface name='%s' desc='14 CFR Part 77.19'>"

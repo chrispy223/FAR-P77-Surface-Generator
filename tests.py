@@ -165,6 +165,19 @@ def airport_checks(path):
 
     chk("transitional coverage has no gaps", *trans_gaps(m))
 
+    # every piece must be fully tiled by its arrangement faces: a dropped
+    # face leaves a hole that shows as a cut in an exported TIN border
+    fbp = m.faces_by_piece()
+    worst_c = 0.0
+    for i, pc in enumerate(m.pieces):
+        fs = fbp.get(i, [])
+        if not fs:
+            continue
+        a = sum(f.area for f in fs)
+        worst_c = max(worst_c, abs(a - pc.poly.area) / max(pc.poly.area, 1.0))
+    chk("exported surfaces have no interior holes", worst_c < 1e-9,
+        "(worst shortfall %.1e)" % worst_c)
+
 
 for path in sys.argv[1:]:
     airport_checks(path)
