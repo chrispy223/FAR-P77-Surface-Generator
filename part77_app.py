@@ -598,7 +598,7 @@ if st.button("Build export", type="primary"):
 
 st.caption("Surfaces are 14 CFR Part 77.19 imaginary surfaces. The horizontal "
            "perimeter uses the 77.19(c) tangent-line construction. "
-           "Transitional surfaces terminate on the horizontal or conical "
-           "surface, with the 77.19(d) 5,000 ft extension where a precision "
-           "approach has climbed past both. Not a substitute for a surveyed "
-           "obstruction analysis.")
+           "Transitional surfaces rise 7:1 and terminate on the horizontal "
+           "surface elevation, with the 77.19(d) 5,000 ft extension where a "
+           "precision approach projects beyond the conical. Not a substitute "
+           "for a surveyed obstruction analysis.")
