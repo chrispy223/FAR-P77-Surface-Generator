@@ -220,7 +220,8 @@ st.caption("14 CFR Part 77.19 · multi-runway · existing and proposed · "
 # button working.
 with st.form("search", clear_on_submit=False):
     c1, c2, c3 = st.columns([2, 1, 1])
-    loc = c1.text_input("Airport ICAO or FAA identifier", value="LFT",
+    loc = c1.text_input("Airport ICAO or FAA identifier", value="",
+                        placeholder="e.g. ATL or KATL",
                         help="Press Enter or click Search")
     c2.write("")
     go = c2.form_submit_button("Search ADIP", type="primary",
