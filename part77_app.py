@@ -135,6 +135,16 @@ def load_dtpp(upload):
     return out
 
 
+@st.cache_data(show_spinner=False)
+def crs_choices(lat, lon):
+    """Label -> EPSG code, for the export coordinate system picker."""
+    opts = {"Local feet about the ARP (no projection)": None}
+    for c in C.suggest_crs(lat, lon):
+        opts["%s — EPSG:%d" % (c["name"], c["code"])] = str(c["code"])
+    opts["Other (enter an EPSG code)"] = None
+    return opts
+
+
 def rows_to_runways(df):
     """Build runways from the table, rejecting anything that would reach the
     geometry with a blank or nonsense coordinate. A NaN survives float() and
@@ -494,40 +504,75 @@ st.caption("DXF carries 3DFACE entities on layers. LandXML carries TIN "
 x1, x2, x3, x4 = st.columns([1.1, 1.1, 1, 1])
 fmt = x1.radio("Format", ["LandXML (TIN surfaces)", "DXF (3DFACE)"],
                label_visibility="collapsed")
-epsg = x2.text_input("EPSG (blank = local feet about the ARP)", value="")
+crs_opts = crs_choices(model.lf.lat0, model.lf.lon0)
+choice = x2.selectbox("Coordinate system", list(crs_opts.keys()),
+                      help="Zones whose published area of use covers this "
+                           "airport. Pick the one your drawing is in.")
+epsg = crs_opts[choice] or ""
+if choice.startswith("Other"):
+    epsg = x2.text_input("EPSG code", value="", placeholder="e.g. 3452")
 inc_ind = x3.checkbox("Individual surfaces", value=True)
 inc_comp = x4.checkbox("Composite", value=True)
+
+split = st.checkbox(
+    "Separate files for individual surfaces and composite", value=False,
+    help="Off: one file holding everything. On: two downloads, so the "
+         "composite can be brought into a drawing on its own.")
 
 if st.button("Build export", type="primary"):
     if not (inc_ind or inc_comp):
         st.error("Select individual surfaces, the composite, or both.")
     else:
         tag = apt["locId"] or "airport"
-        try:
-            with st.spinner("Writing export…"):
-                if fmt.startswith("LandXML"):
-                    data = C.to_landxml(model, comp, epsg.strip() or None,
-                                        individual=inc_ind,
-                                        use_composite=inc_comp)
-                    fname, mime = "%s_Part77.xml" % tag, "application/xml"
-                    names = sorted(C.tin_groups(model, comp, inc_ind,
-                                                inc_comp).keys())
-                    stats = None
-                else:
-                    data, stats = C.to_dxf(model, comp, epsg.strip() or None,
-                                           individual=inc_ind,
-                                           use_composite=inc_comp)
-                    fname, mime = "%s_Part77.dxf" % tag, "application/dxf"
-                    names = None
+        landxml = fmt.startswith("LandXML")
+        ext = "xml" if landxml else "dxf"
+        mime = "application/xml" if landxml else "application/dxf"
+        code = epsg.strip() or None
+
+        def build(want_ind, want_comp):
+            if landxml:
+                data = C.to_landxml(model, comp, code, individual=want_ind,
+                                    use_composite=want_comp)
+                names = sorted(C.tin_groups(model, comp, want_ind,
+                                            want_comp).keys())
+                return data, names, None
+            data, stats = C.to_dxf(model, comp, code, individual=want_ind,
+                                   use_composite=want_comp)
+            return data, None, stats
+
+        def show(label, fname, data, names, stats):
             st.download_button("Download " + fname, data, file_name=fname,
-                               mime=mime)
+                               mime=mime, key="dl_" + fname)
             if names:
-                st.dataframe(pd.DataFrame({"TIN surface": names}),
+                st.dataframe(pd.DataFrame({label: names}),
                              use_container_width=True, hide_index=True)
             if stats:
                 st.dataframe(pd.DataFrame(sorted(stats.items()),
                                           columns=["Layer", "3DFACE count"]),
                              use_container_width=True, hide_index=True)
+
+        try:
+            with st.spinner("Writing export…"):
+                jobs = []
+                if split:
+                    if inc_ind:
+                        jobs.append(("Individual surfaces",
+                                     "%s_Part77_Surfaces.%s" % (tag, ext),
+                                     True, False))
+                    if inc_comp:
+                        jobs.append(("Composite",
+                                     "%s_Part77_Composite.%s" % (tag, ext),
+                                     False, True))
+                else:
+                    jobs.append(("TIN surface",
+                                 "%s_Part77.%s" % (tag, ext),
+                                 inc_ind, inc_comp))
+                built = [(lbl, fn) + build(wi, wc) for lbl, fn, wi, wc in jobs]
+            for lbl, fn, data, names, stats in built:
+                if split:
+                    st.markdown("**%s**" % lbl)
+                show(lbl if not split else "TIN surface", fn, data, names,
+                     stats)
         except Exception as ex:
             st.error("Export failed: %s" % ex)
 

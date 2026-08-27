@@ -27,7 +27,7 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split as shp_split
 
-__version__ = "2026-08-21.14"
+__version__ = "2026-08-21.16"
 
 US_FT = 1200.0 / 3937.0
 EARTH_R_FT = 20925721.8  # mean earth radius, US survey feet
@@ -1082,6 +1082,66 @@ def to_mesh3d(model, composite=None, use_composite=False, merge=True):
     return {"groups": groups, "edges": edges, "colors": colors,
             "elev": model.elev, "horiz_z": model.horiz_z,
             "cone_z": model.cone_z}
+
+
+# Names in the EPSG database do not say "State Plane" — Louisiana South is
+# published as "NAD83 / Louisiana South (ftUS)" — so zones are identified by
+# excluding the projections that are clearly not a state plane zone.
+_CRS_REJECT = ("utm", "mercator", "albers", "ease-grid", "equidistant",
+               "pdc ", "world", "pseudo", "polar", "lcc", "laea", "gnomonic",
+               "oblique", "conus", "north pole", "south pole", "island grid",
+               # BLM zones are UTM under another name, and these statewide
+               # or national systems are not state plane zones either
+               "blm", "canada", "atlas", "gic ", "teale", "statewide")
+
+
+def suggest_crs(lat, lon, limit=8):
+    """Projected CRSs whose published area of use contains this airport.
+
+    Ranked so the plain NAD83 state plane zone in US survey feet — what a
+    Civil 3D drawing normally sits in — comes first, with the realization
+    variants after it. Returns [] rather than raising if pyproj or its
+    database is unavailable.
+    """
+    try:
+        from pyproj.database import query_crs_info
+        from pyproj.aoi import AreaOfInterest
+        from pyproj import CRS
+    except Exception:
+        return []
+    try:
+        infos = query_crs_info(
+            auth_name="EPSG", pj_types=("PROJECTED_CRS",),
+            area_of_interest=AreaOfInterest(lon - 0.02, lat - 0.02,
+                                            lon + 0.02, lat + 0.02),
+            contains=True)
+    except Exception:
+        return []
+
+    out = []
+    for i in infos:
+        name = i.name
+        low = name.lower()
+        if any(r in low for r in _CRS_REJECT):
+            continue
+        if "nad83" not in low and "nad27" not in low:
+            continue
+        try:
+            unit = CRS.from_epsg(int(i.code)).axis_info[0].unit_name.lower()
+        except Exception:
+            continue
+        feet = "foot" in unit or "feet" in unit
+        datum = name.split("/")[0].strip()
+        rank = (0 if datum == "NAD83" else
+                1 if datum.startswith("NAD83(2011)") else
+                2 if datum.startswith("NAD83") else 3,
+                0 if feet else 1,
+                1 if "offshore" in low else 0,
+                name)
+        out.append((rank, {"code": int(i.code), "name": name,
+                           "units": "US survey feet" if feet else "meters"}))
+    out.sort(key=lambda r: r[0])
+    return [d for _, d in out[:limit]]
 
 
 def _projector(model, epsg):
