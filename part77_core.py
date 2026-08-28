@@ -83,6 +83,32 @@ def display_kind(kind, merge=True):
     return (pre + ":" + k) if pre else k
 
 
+# Where two surfaces meet, they are equal along the shared edge, and which
+# one "wins" there is decided by noise. The transitional terminates exactly
+# on the horizontal, and its outer edge is a polyline through stations 200 ft
+# apart, so between stations the chord bulges a hair past the true curve and
+# the transitional reads fractionally high. Lowest-wins then hands the
+# horizontal a sliver a few hundred square feet in size, sitting inside the
+# inner surface as a notch. Ties within TIE_TOL go to the surface with the
+# lower priority number instead, which keeps the inner surfaces whole and
+# matches how these are drawn.
+TIE_TOL = 0.10
+
+PRIORITY = {"PRIMARY": 0, "APPROACH": 1, "APPROACH2": 1,
+            "TRANSITIONAL": 2, "TRANSITIONAL5000": 2,
+            "CONICAL": 3, "HORIZONTAL": 4}
+
+
+def lowest(cand, x, y):
+    """The controlling surface at a point, ties broken by priority."""
+    zs = [(pc.z(x, y), pc) for pc in cand]
+    lo = min(z for z, _ in zs)
+    tied = [(PRIORITY.get(pc.kind, 9), i, z, pc)
+            for i, (z, pc) in enumerate(zs) if z <= lo + TIE_TOL]
+    tied.sort()
+    return tied[0][3]
+
+
 COLORS = {
     "PRIMARY": "#3ddc84", "APPROACH": "#ff5a5a", "APPROACH2": "#ffab3d",
     "TRANSITIONAL": "#5b97ff", "TRANSITIONAL5000": "#a8c8ff",
@@ -401,7 +427,7 @@ class Model:
         z_at_s0 = ie0[1] - side * (side * ie0[0]) / TRANS_SLOPE
         plane = f.plane_from_st(z_at_s0 - dz_ds * s0, dz_ds, dz_dt)
 
-        n = max(4, int(abs(ds) / 200.0))
+        n = max(4, int(abs(ds) / 50.0))
         stations = [s0 + ds * i / n for i in range(n + 1)]
 
         def build(rings):
@@ -439,11 +465,15 @@ class Model:
         term = build((inner_pts, outer_pts))
         emit(term, "TRANSITIONAL")
 
-        # Precision wing. Cutting this against the conical arc while the
-        # terminated strip is cut against the ceiling by station sampling
-        # left a gap between them: two clips of the same edge that do not
-        # agree. Subtract the terminated strip itself instead, so the two
-        # share an exact boundary and nothing can fall between.
+        # Precision wing. Building it at full width over every station and
+        # subtracting the terminated strip leaves hairline slivers: the strip
+        # is emitted as several pieces on different station bounds, and
+        # differencing a multi-part polygon out of a single one does not
+        # cancel exactly along the seams. Those slivers survive the composite
+        # in the thin band where the wing crosses the horizontal and export
+        # as detached threads. Build the wing off the strip's own outer edge
+        # on the same stations instead, so the two are adjacent by
+        # construction and nothing can fall between or overlap.
         if e.crit["precision"]:
             inner_pts, outer_pts = [], []
             for st in stations:
@@ -451,13 +481,15 @@ class Model:
                 if ie is None:
                     continue
                 half, z_in = ie
-                inner_pts.append(f.world(st, side * half))
+                run = 0.0
+                if not self.beyond_conical(f, st, side, half):
+                    run = self._trans_run(f, e, st, side, half, z_in)
+                if run >= TRANS_RUN_PRECISION:
+                    continue
+                inner_pts.append(f.world(st, side * (half + run)))
                 outer_pts.append(
                     f.world(st, side * (half + TRANS_RUN_PRECISION)))
-            full = build((inner_pts, outer_pts))
-            if full is not None:
-                wing = full.difference(term) if term is not None else full
-                emit(wing, "TRANSITIONAL5000")
+            emit(build((inner_pts, outer_pts)), "TRANSITIONAL5000")
 
     def beyond_conical(self, f, s, side, half):
         """True where the approach edge at this station lies outside the
@@ -626,17 +658,11 @@ class Model:
                     pts.append((float(gx), float(gy)))
         winners = set()
         for x, y in pts:
-            best, who = None, None
-            for pc in cand:
-                z = pc.z(x, y)
-                if best is None or z < best - 1e-9:
-                    best, who = z, pc
-            winners.add(id(who))
+            winners.add(id(lowest(cand, x, y)))
 
         if len(winners) == 1 or depth >= 8:
             x, y = face.representative_point().coords[0]
-            who = min(cand, key=lambda pc: pc.z(x, y))
-            return [(face, who)]
+            return [(face, lowest(cand, x, y))]
 
         # Two or more surfaces are lowest somewhere in this face. Try every
         # winning pair until a cut actually divides it: with several
@@ -661,7 +687,7 @@ class Model:
                 if parts:
                     return parts
         x, y = face.representative_point().coords[0]
-        return [(face, min(cand, key=lambda pc: pc.z(x, y)))]
+        return [(face, lowest(cand, x, y))]
 
     def _crossing(self, face, A, B):
         """Line or curve where two surfaces are at equal elevation."""
@@ -1284,6 +1310,57 @@ def composite_groups(model, composite=None, tol=0.5):
         out[GROUP_CONICAL] = conical
     for num, items in outer.items():
         out[approach_group_name(outer_ends[num])] = items
+    return _absorb_slivers(out)
+
+
+def _absorb_slivers(groups, max_width=8.0):
+    """Move hairline faces into the group that surrounds them.
+
+    Where two surfaces cross at a shallow angle the arrangement throws a
+    face a couple of feet wide and hundreds of feet long. Assigned strictly
+    by elevation it can land in a different group from everything around it,
+    and then it draws as a second boundary line running alongside the first.
+    Dropping it is not an option — a dropped face is a hole in whatever
+    surface covered it, which is how v19 cut notches into exported TINs.
+    Reassigning it preserves the partition exactly: the same faces come out,
+    only labelled by the neighbour they are embedded in.
+    """
+    from shapely.strtree import STRtree
+
+    flat = [(name, poly, pc)
+            for name, items in groups.items() for poly, pc in items]
+    polys = [p for _, p, _ in flat]
+    if not polys:
+        return groups
+    tree = STRtree(polys)
+
+    moved = 0
+    for i, (name, poly, pc) in enumerate(flat):
+        per = poly.length
+        if per <= 0 or 4.0 * poly.area / per > max_width:
+            continue
+        share = {}
+        for j in tree.query(poly.buffer(0.5)):
+            if j == i or flat[j][0] == name:
+                continue
+            try:
+                ln = poly.buffer(0.01).intersection(polys[j]).length
+            except Exception:
+                continue
+            if ln > 0:
+                share[flat[j][0]] = share.get(flat[j][0], 0.0) + ln
+        if not share:
+            continue
+        best = max(share, key=share.get)
+        if share[best] > per * 0.25:
+            flat[i] = (best, poly, pc)
+            moved += 1
+
+    if not moved:
+        return groups
+    out = {}
+    for name, poly, pc in flat:
+        out.setdefault(name, []).append((poly, pc))
     return out
 
 
@@ -1352,7 +1429,38 @@ def to_landxml(model, composite=None, epsg=None, individual=True,
            "<Surfaces>"]
     groups = tin_groups(model, composite, individual, use_composite,
                         use_groups)
+
+    def separate(tris):
+        """Pull apart points that share a plan position but not an elevation.
+
+        A merged group can touch itself at a corner across a vertical step:
+        one runway's wing domain ends where the parallel runway's approach is
+        still hundreds of feet higher. The areas do not overlap, only the
+        corner coincides, so the group is still single valued. A TIN is not.
+        Civil 3D welds the duplicate on import and retriangulates around it,
+        throwing spikes and fans across the surface and cutting false borders
+        through it. Nudging one of the two by a hundredth of a foot keeps the
+        geometry where it belongs and lets the surface build.
+        """
+        seen = {}
+        for t in tris:
+            for i, (x, y, z) in enumerate(t):
+                key = (round(x, 4), round(y, 4))
+                zs = seen.setdefault(key, [])
+                hit = None
+                for j, zz in enumerate(zs):
+                    if abs(zz - z) <= 1e-4:
+                        hit = j
+                        break
+                if hit is None:
+                    zs.append(z)
+                    hit = len(zs) - 1
+                if hit:
+                    t[i] = (x + 0.01 * hit, y + 0.01 * hit, z)
+        return tris
+
     for name, tris in sorted(groups.items()):
+        tris = separate(tris)
         ids, pts, faces = {}, [], []
         for t in tris:
             f = []
