@@ -1310,7 +1310,212 @@ def composite_groups(model, composite=None, tol=0.5):
         out[GROUP_CONICAL] = conical
     for num, items in outer.items():
         out[approach_group_name(outer_ends[num])] = items
-    return _absorb_slivers(out)
+    return _node_groups(_absorb_slivers(out))
+
+
+def _split_at_cliffs(groups, tol=0.5):
+    """Break a group wherever it steps vertically, so each surface is continuous.
+
+    Merging parallel ends puts a cliff inside a group. At PDX 10L's 5,000 ft
+    wing ends where 10R's approach is still 422 ft higher, and lowest-wins
+    correctly takes the step. A TIN holds one elevation per plan position
+    and cannot carry that, so the two sides meet as unmatched edges and the
+    border draws a slit down the middle of the approach.
+
+    This is the reason the composite was split into groups in the first
+    place: a cliff has to fall *between* surfaces, not inside one. Faces are
+    joined only where they share an edge and agree on elevation across it,
+    and each connected run is exported on its own. A group that never steps
+    is untouched and keeps its name.
+    """
+    from shapely.strtree import STRtree
+
+    out = {}
+    for name, items in groups.items():
+        if len(items) < 2:
+            out[name] = items
+            continue
+        polys = [p for p, _ in items]
+        tree = STRtree(polys)
+        parent = list(range(len(items)))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        for i, (pa, ca) in enumerate(items):
+            for j in tree.query(pa.buffer(0.5)):
+                if j <= i:
+                    continue
+                pb, cb = items[j]
+                try:
+                    shared = pa.buffer(0.01).intersection(pb)
+                except Exception:
+                    continue
+                if shared.is_empty or shared.length <= 1.0:
+                    continue
+                pt = shared.representative_point()
+                if abs(ca.z(pt.x, pt.y) - cb.z(pt.x, pt.y)) > tol:
+                    continue                      # a cliff: leave them apart
+                ra, rb = find(i), find(j)
+                if ra != rb:
+                    parent[ra] = rb
+
+        runs = {}
+        for i in range(len(items)):
+            runs.setdefault(find(i), []).append(items[i])
+        if len(runs) < 2:
+            out[name] = items
+            continue
+        ordered = sorted(runs.values(), key=lambda v: -sum(p.area for p, _ in v))
+        for k, part in enumerate(ordered, 1):
+            out["%s %d" % (name, k)] = part
+    return out
+
+
+def _node_groups(groups):
+    """Node every group's faces against each other, as arrangement() does.
+
+    Composite faces abut without sharing vertices. _assign splits a face on
+    a crossing line, which plants a vertex on that face's boundary but not
+    on the neighbour across it, and the two then share a segment
+    geometrically while disagreeing about its vertices. Their triangles fail
+    to meet, and the surface border traces up one side of the seam and back
+    down the other - a slit that draws as a line through the middle of a
+    sound surface. At PDX one ran 6,120 ft down the 28 approach, between
+    28L's approach at 817 vertices and 28R's wing at 170.
+
+    Inserting the missing vertices one edge at a time was tried first and
+    only moved the problem around: the totals across the five surfaces were
+    identical before and after. This does what Model.arrangement() already
+    does for pieces - unions all the boundaries so every crossing becomes a
+    node, then rebuilds the faces from that - which is what removed
+    T-junctions in the first place. Faces come back split more finely; the
+    covered area is unchanged, and each new face inherits the piece whose
+    face contains it.
+    """
+    from shapely.strtree import STRtree
+
+    out = {}
+    for name, items in groups.items():
+        if len(items) < 2:
+            out[name] = items
+            continue
+        lines = []
+        for poly, _ in items:
+            lines.append(LineString(poly.exterior.coords))
+            for r in poly.interiors:
+                lines.append(LineString(r.coords))
+        try:
+            noded = list(polygonize(unary_union(lines)))
+        except Exception:
+            out[name] = items
+            continue
+        if not noded:
+            out[name] = items
+            continue
+
+        polys = [p for p, _ in items]
+        tree = STRtree(polys)
+        rebuilt, claimed = [], 0.0
+        for face in noded:
+            pt = face.representative_point()
+            hit = None
+            for j in tree.query(pt):
+                if polys[j].covers(pt):
+                    hit = j
+                    break
+            if hit is None:
+                continue
+            rebuilt.append((face, items[hit][1]))
+            claimed += face.area
+
+        before = sum(p.area for p in polys)
+        if not rebuilt or abs(claimed - before) > max(1.0, before * 1e-9):
+            out[name] = items          # noding lost area; keep the original
+            continue
+        out[name] = rebuilt
+    return out
+
+
+def _weld_tjunctions(groups, tol=0.05):
+    """Insert a neighbour's vertex into any edge that runs through it.
+
+    Splitting a face on a crossing line puts a new vertex on that face's
+    boundary. The face on the other side of the boundary keeps its original
+    edge, so the two no longer share vertices along a segment they share
+    geometrically. Their triangles then fail to meet and the surface border
+    traces up one side of the seam and back down the other: a hole of zero
+    area that draws as a line across the middle of an otherwise sound
+    surface. This is the same T-junction failure that cut the exported TINs
+    in v19, one level up - between composite faces rather than inside a
+    triangulation.
+
+    Only collinear vertices are added, so every polygon keeps its exact
+    shape and area.
+    """
+    from shapely.strtree import STRtree
+
+    out = {}
+    for name, items in groups.items():
+        pts = set()
+        for poly, _ in items:
+            for ring in [poly.exterior] + list(poly.interiors):
+                for x, y in ring.coords[:-1]:
+                    pts.add((x, y))
+        if not pts:
+            out[name] = items
+            continue
+        plist = sorted(pts)
+        tree = STRtree([Point(p) for p in plist])
+
+        def weld(ring):
+            src = list(ring.coords)
+            new = []
+            for i in range(len(src) - 1):
+                ax, ay = src[i]
+                bx, by = src[i + 1]
+                new.append((ax, ay))
+                dx, dy = bx - ax, by - ay
+                dd = dx * dx + dy * dy
+                if dd <= 0:
+                    continue
+                seg = LineString([(ax, ay), (bx, by)])
+                hits = []
+                for j in tree.query(seg.buffer(tol)):
+                    px, py = plist[j]
+                    if (abs(px - ax) < tol and abs(py - ay) < tol) or \
+                       (abs(px - bx) < tol and abs(py - by) < tol):
+                        continue
+                    t = ((px - ax) * dx + (py - ay) * dy) / dd
+                    if t <= 0.0 or t >= 1.0:
+                        continue
+                    if abs((px - ax) * dy - (py - ay) * dx) / (dd ** 0.5) > tol:
+                        continue
+                    hits.append((t, px, py))
+                hits.sort()
+                for _, px, py in hits:
+                    new.append((px, py))
+            new.append(src[-1])
+            return new
+
+        fixed = []
+        for poly, pc in items:
+            ext = weld(poly.exterior)
+            ints = [weld(r) for r in poly.interiors]
+            try:
+                q = Polygon(ext, ints)
+                if not q.is_valid:
+                    q = q.buffer(0)
+                if q.is_empty or abs(q.area - poly.area) > 1.0:
+                    q = poly
+            except Exception:
+                q = poly
+            fixed.append((q, pc))
+        out[name] = fixed
+    return out
 
 
 def _absorb_slivers(groups, max_width=8.0):
@@ -1430,43 +1635,185 @@ def to_landxml(model, composite=None, epsg=None, individual=True,
     groups = tin_groups(model, composite, individual, use_composite,
                         use_groups)
 
-    def separate(tris):
-        """Pull apart points that share a plan position but not an elevation.
+    def weld_faces(tris, tol=0.02):
+        """Split a triangle edge that runs through a neighbour's vertex.
 
-        A merged group can touch itself at a corner across a vertical step:
-        one runway's wing domain ends where the parallel runway's approach is
-        still hundreds of feet higher. The areas do not overlap, only the
-        corner coincides, so the group is still single valued. A TIN is not.
-        Civil 3D welds the duplicate on import and retriangulates around it,
-        throwing spikes and fans across the surface and cutting false borders
-        through it. Nudging one of the two by a hundredth of a foot keeps the
-        geometry where it belongs and lets the surface build.
+        Noding fixes the faces, but triangles are built afterwards and the
+        conical is cut into ring bands at that point, so its mesh carries
+        vertices its neighbours never see. Where one triangle's edge passes
+        through another's vertex the two do not share that edge, and the
+        border traces up one side of the seam and back down the other - the
+        slit that draws as a line across a sound surface.
+
+        Insertions are resolved per shared edge, not per triangle. Deciding
+        independently lets the two triangles either side of an edge disagree
+        near the tolerance and breaks a join that was previously sound; done
+        this way both get the same points in the same order.
+
+        A vertex is only inserted where its elevation matches what the edge
+        interpolates there, which keeps the weld off a genuine step: at a
+        cliff two points share a plan position at different heights and have
+        to stay apart.
         """
-        seen = {}
+        from shapely.strtree import STRtree
+
+        # the original vertex is kept, not the rounded key - inserting the
+        # rounded coordinate puts the point up to tol off the edge and
+        # leaves a hairline sliver along every weld
+        keys = {}
         for t in tris:
-            for i, (x, y, z) in enumerate(t):
-                key = (round(x, 4), round(y, 4))
-                zs = seen.setdefault(key, [])
-                hit = None
-                for j, zz in enumerate(zs):
-                    if abs(zz - z) <= 1e-4:
-                        hit = j
-                        break
-                if hit is None:
-                    zs.append(z)
-                    hit = len(zs) - 1
-                if hit:
-                    t[i] = (x + 0.01 * hit, y + 0.01 * hit, z)
+            for x, y, z in t:
+                keys.setdefault((round(x, 3), round(y, 3)), []).append((x, y, z))
+        plist = sorted(keys)
+        if not plist:
+            return tris
+        tree = STRtree([Point(p) for p in plist])
+
+        def ekey(a, b):
+            ka = (round(a[0], 3), round(a[1], 3), round(a[2], 3))
+            kb = (round(b[0], 3), round(b[1], 3), round(b[2], 3))
+            return (ka, kb) if ka <= kb else (kb, ka)
+
+        cuts = {}
+        for t in tris:
+            for i in range(3):
+                a, b = t[i], t[(i + 1) % 3]
+                k = ekey(a, b)
+                if k in cuts:
+                    continue
+                ax, ay, az = a
+                bx, by, bz = b
+                dx, dy = bx - ax, by - ay
+                dd = dx * dx + dy * dy
+                if dd <= 0:
+                    cuts[k] = []
+                    continue
+                L = dd ** 0.5
+                seg = LineString([(ax, ay), (bx, by)])
+                hits = []
+                for j in tree.query(seg.buffer(tol)):
+                    px, py = plist[j]
+                    if (abs(px - ax) < tol and abs(py - ay) < tol) or \
+                       (abs(px - bx) < tol and abs(py - by) < tol):
+                        continue
+                    if abs((px - ax) * dy - (py - ay) * dx) / L > tol:
+                        continue
+                    u = ((px - ax) * dx + (py - ay) * dy) / dd
+                    if u <= 1e-9 or u >= 1.0 - 1e-9:
+                        continue
+                    zi = az + (bz - az) * u
+                    zs = [v for v in keys[(px, py)] if abs(v[2] - zi) <= 0.01]
+                    if not zs:
+                        continue          # a step: leave this edge alone
+                    hits.append((u, zs[0]))
+                hits.sort()
+                # store against the canonical direction of the edge key
+                fwd = ((round(ax, 3), round(ay, 3), round(az, 3)) == k[0])
+                cuts[k] = [p for _, p in hits] if fwd else \
+                          [p for _, p in reversed(hits)]
+
+        out = []
+        for t in tris:
+            ring, added = [], False
+            for i in range(3):
+                a, b = t[i], t[(i + 1) % 3]
+                ring.append(a)
+                k = ekey(a, b)
+                ins = cuts.get(k) or []
+                if not ins:
+                    continue
+                fwd = ((round(a[0], 3), round(a[1], 3), round(a[2], 3)) == k[0])
+                ring.extend(ins if fwd else list(reversed(ins)))
+                added = True
+            if not added:
+                out.append(t)
+                continue
+            for m in range(1, len(ring) - 1):
+                out.append([ring[0], ring[m], ring[m + 1]])
+        return out
+
+    def separate(tris):
+        """Split vertices that join two otherwise separate pieces of surface.
+
+        A group can touch itself at a single vertex. Two cases arise. One is
+        a corner meeting across a vertical step, where a runway's wing domain
+        ends while the parallel runway's approach is still hundreds of feet
+        higher. The other is a pinch at equal elevation, where the horizontal
+        wraps around the inner surfaces and its hole boundary closes to a
+        point; PDX has nineteen of those. Either way the areas do not
+        overlap, so the group stays single valued, but a TIN cannot carry a
+        vertex belonging to two disconnected fans: Civil 3D welds it, and the
+        border runs out to the point and back as a thin spike.
+
+        Triangles around each vertex are grouped into fans by shared edges.
+        A vertex with one fan is ordinary and left alone. Where there are
+        more, every fan after the first has its copy moved a hundredth of a
+        foot, which separates the pieces without moving anything a survey
+        could measure.
+        """
+        at = {}
+        for ti, t in enumerate(tris):
+            for ci, (x, y, z) in enumerate(t):
+                at.setdefault((round(x, 3), round(y, 3), round(z, 3)),
+                              []).append((ti, ci))
+
+        for key, uses in at.items():
+            if len(uses) < 2:
+                continue
+            # two triangles belong to the same fan if they share an edge
+            # through this vertex, i.e. another vertex in common
+            others = []
+            for ti, ci in uses:
+                t = tris[ti]
+                others.append(set((round(p[0], 3), round(p[1], 3),
+                                   round(p[2], 3))
+                                  for j, p in enumerate(t) if j != ci))
+            n = len(uses)
+            comp = list(range(n))
+
+            def find(a):
+                while comp[a] != a:
+                    comp[a] = comp[comp[a]]
+                    a = comp[a]
+                return a
+
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if others[i] & others[j]:
+                        ri, rj = find(i), find(j)
+                        if ri != rj:
+                            comp[ri] = rj
+            roots = {}
+            for i in range(n):
+                roots.setdefault(find(i), []).append(i)
+            if len(roots) < 2:
+                continue
+            for k, (_, members) in enumerate(sorted(roots.items())):
+                if k == 0:
+                    continue
+                for i in members:
+                    ti, ci = uses[i]
+                    x, y, z = tris[ti][ci]
+                    tris[ti][ci] = (x + 0.01 * k, y + 0.01 * k, z)
         return tris
 
     for name, tris in sorted(groups.items()):
-        tris = separate(tris)
+        tris = separate(weld_faces([list(t) for t in tris]))
+        # Snap to a thousandth of a foot before indexing. Shapely's boolean
+        # operations leave vertices apart in the fourth decimal - a
+        # thousandth of an inch - which are the same point in every sense
+        # that matters. Emitted as distinct points they overrun Civil 3D's
+        # own merge tolerance: it welds them, the face list stops describing
+        # a valid triangulation, and it rebuilds the surface by Delaunay.
+        # That rebuild is what cut 148 million square feet out of the 28
+        # approach at PDX, and it is why imported triangle counts came back
+        # at a third of what was written.
         ids, pts, faces = {}, [], []
         for t in tris:
             f = []
             for x, y, z in t:
                 X, Y = xf(x, y) if xf else (x, y)
-                key = (round(X, 4), round(Y, 4), round(z, 4))
+                key = (round(X, 3), round(Y, 3), round(z, 3))
                 n = ids.get(key)
                 if n is None:
                     n = len(pts) + 1
