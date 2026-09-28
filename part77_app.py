@@ -230,7 +230,7 @@ for k, v in (("rows", None), ("apt", None), ("model", None),
 st.title("✈ FAR Part 77 Airspace Surface Generator")
 st.caption("14 CFR Part 77.19 · multi-runway · existing and proposed · "
            "surfaces reduced to the lowest controlling elevation · "
-           "engine v%s" % C.__version__)
+           "engine %s" % C.__version__)
 
 # A form so Enter in the identifier field submits, rather than only the
 # button working.
@@ -376,6 +376,8 @@ if e2.button("Generate Part 77 surfaces", type="primary"):
                 S.composite = S.model.composite()
                 S.pop("mesh_comp", None)
                 S.pop("mesh_ind", None)
+                S.pop("_3d_html", None)
+                S.pop("_3d_stamp", None)
         except Exception as ex:
             S.model = S.composite = None
             st.error("Could not build the surfaces: %s\n\nCheck the runway "
@@ -391,20 +393,34 @@ model, comp = S.model, S.composite
 st.subheader("Part 77 surfaces")
 tab_map, tab_3d = st.tabs(["Map", "3D view"])
 
+# Streamlit fixes an embedded component's height when the iframe is created
+# and JavaScript inside it cannot grow past that, so neither window can be
+# dragged from its own corner. The height has to come from this side, which
+# is what these sliders are. Width already follows the column.
+SIZE_HELP = ("Taller window. Streamlit sets an embedded view's height when "
+             "it is created, so this has to be set here rather than by "
+             "dragging the corner.")
+
 with tab_map:
-    mode = st.radio("View", ["Composite (controlling surface)",
+    c1, c2 = st.columns([3, 2])
+    mode = c1.radio("View", ["Composite (controlling surface)",
                              "Individual surfaces"],
                     horizontal=True, label_visibility="collapsed")
+    map_h = c2.slider("Window height", 400, 1800, 580, 20,
+                      key="map_h", help=SIZE_HELP)
     is_comp = mode.startswith("Composite")
     st.caption("Move the cursor over the map for the exact Part 77 elevation "
                "at that point. Overlapping areas show only the lowest surface.")
     st.components.v1.html(
         M.render(C.to_geojson(model, comp if is_comp else None),
-                 height=580, composite=is_comp), height=580)
+                 height=map_h, composite=is_comp), height=map_h)
 
 with tab_3d:
-    use_comp = st.toggle("Show composite instead of individual surfaces",
+    c1, c2 = st.columns([3, 2])
+    use_comp = c1.toggle("Show composite instead of individual surfaces",
                          value=False, key="3d_comp")
+    view_h = c2.slider("Window height", 400, 1800, 620, 20,
+                       key="view_h", help=SIZE_HELP)
     st.caption("Drag to orbit, shift-drag or right-drag to pan, wheel to "
                "zoom. One finger orbits and two fingers pan and pinch on a "
                "touch screen. At true scale these surfaces are nearly "
@@ -413,9 +429,15 @@ with tab_3d:
     key = "mesh_comp" if use_comp else "mesh_ind"
     if key not in S:
         with st.spinner("Building mesh (once per generation)…"):
-            S[key] = V3.render(
-                C.to_mesh3d(model, comp, use_composite=use_comp), height=620)
-    st.components.v1.html(S[key], height=620)
+            S[key] = C.to_mesh3d(model, comp, use_composite=use_comp)
+    # The mesh is cached, the rendered page is not: building the mesh is the
+    # slow step (a quarter of a minute at BNA) and must not run again just
+    # because the window was resized. Only the cheap render repeats, and
+    # only when the mesh or the height actually changes.
+    if S.get("_3d_stamp") != (key, view_h):
+        S["_3d_html"] = V3.render(S[key], height=view_h)
+        S["_3d_stamp"] = (key, view_h)
+    st.components.v1.html(S["_3d_html"], height=view_h)
 
 with st.expander("Surface parameters", expanded=True):
     rows = []
